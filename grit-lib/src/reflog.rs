@@ -184,7 +184,6 @@ pub fn delete_reflog_entries(git_dir: &Path, refname: &str, indices: &[usize]) -
 
     let indices_set: std::collections::HashSet<usize> = indices.iter().copied().collect();
 
-    let path = reflog_path(git_dir, refname);
     let remaining: Vec<&ReflogEntry> = entries
         .iter()
         .enumerate()
@@ -198,6 +197,16 @@ pub fn delete_reflog_entries(git_dir: &Path, refname: &str, indices: &[usize]) -
         lines.push(format_reflog_entry(entry));
     }
 
+    if crate::reftable::is_reftable_repo(git_dir) {
+        let kept: Vec<ReflogEntry> = remaining
+            .iter()
+            .rev()
+            .map(|entry| (*entry).clone())
+            .collect();
+        return crate::reftable::reftable_replace_reflog(git_dir, refname, &kept);
+    }
+
+    let path = reflog_path(git_dir, refname);
     fs::write(&path, lines.join(""))?;
     Ok(())
 }
@@ -211,8 +220,8 @@ pub fn expire_reflog(git_dir: &Path, refname: &str, expire_time: Option<i64>) ->
         return Ok(0);
     }
 
-    let path = reflog_path(git_dir, refname);
     let mut kept = Vec::new();
+    let mut kept_entries = Vec::new();
     let mut pruned = 0usize;
 
     for entry in &entries {
@@ -225,10 +234,16 @@ pub fn expire_reflog(git_dir: &Path, refname: &str, expire_time: Option<i64>) ->
         if dominated {
             pruned += 1;
         } else {
+            kept_entries.push(entry.clone());
             kept.push(format_reflog_entry(entry));
         }
     }
 
+    if crate::reftable::is_reftable_repo(git_dir) {
+        crate::reftable::reftable_replace_reflog(git_dir, refname, &kept_entries)?;
+        return Ok(pruned);
+    }
+    let path = reflog_path(git_dir, refname);
     fs::write(&path, kept.join(""))?;
     Ok(pruned)
 }
@@ -332,6 +347,9 @@ pub fn mirror_branch_reflog_to_head(git_dir: &Path, branch_refname: &str) -> Res
 
 /// List all refs that have reflogs.
 pub fn list_reflog_refs(git_dir: &Path) -> Result<Vec<String>> {
+    if crate::reftable::is_reftable_repo(git_dir) {
+        return crate::reftable::reftable_list_reflog_refs(git_dir);
+    }
     let mut refs = Vec::new();
     let mut seen = HashSet::new();
 
@@ -674,9 +692,7 @@ pub fn expire_reflog_git(
     gc_global_unreachable: Option<i64>,
     now: i64,
 ) -> Result<usize> {
-    if crate::reftable::is_reftable_repo(git_dir) {
-        return Ok(0);
-    }
+    let is_reftable = crate::reftable::is_reftable_repo(git_dir);
     let base_total = gc_global_total.unwrap_or_else(|| default_expire_total(now));
     let base_unreachable = gc_global_unreachable.unwrap_or_else(|| default_expire_unreachable(now));
     let (expire_total, expire_unreachable) = resolve_expire_for_ref(
@@ -710,8 +726,8 @@ pub fn expire_reflog_git(
     if entries.is_empty() {
         return Ok(0);
     }
-    let path = reflog_path(git_dir, refname);
     let mut kept = Vec::new();
+    let mut kept_entries = Vec::new();
     let mut pruned = 0usize;
 
     for entry in &entries {
@@ -737,14 +753,19 @@ pub fn expire_reflog_git(
             if params.verbose {
                 println!("keep {}", entry.message);
             }
+            kept_entries.push(entry.clone());
             kept.push(format_reflog_entry(entry));
         }
     }
 
     if !params.dry_run && pruned > 0 {
-        if kept.is_empty() {
+        if is_reftable {
+            crate::reftable::reftable_replace_reflog(git_dir, refname, &kept_entries)?;
+        } else if kept.is_empty() {
+            let path = reflog_path(git_dir, refname);
             let _ = fs::remove_file(&path);
         } else {
+            let path = reflog_path(git_dir, refname);
             fs::write(&path, kept.join(""))?;
         }
     }

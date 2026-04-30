@@ -1469,6 +1469,11 @@ fn collect_ref_dir(dir: &Path, stack: &mut Vec<ObjectId>) -> Result<()> {
 }
 
 fn pack_refs_auto_needed(repo: &Repository) -> bool {
+    if grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
+        return grit_lib::reftable::ReftableStack::open(&repo.git_dir)
+            .map(|stack| stack.table_names().len() > 2)
+            .unwrap_or(false);
+    }
     let heads = repo.git_dir.join("refs").join("heads");
     let n = fs::read_dir(&heads).map(|d| d.count()).unwrap_or(0);
     n > 1 || repo.git_dir.join("packed-refs").is_file()

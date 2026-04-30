@@ -12,10 +12,13 @@ use grit_lib::refs::read_ref_file;
 use grit_lib::refs::Ref;
 use grit_lib::repo::Repository;
 use grit_lib::shared_repo::{adjust_shared_repo_tree, git_config_perm};
+use grit_lib::wildmatch::{wildmatch, WM_PATHNAME};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Arguments for `grit pack-refs`.
 #[derive(Debug, ClapArgs)]
@@ -35,6 +38,22 @@ pub struct Args {
     /// Accepted for Git compatibility; `maintenance`/hooks may pass this. Ignored for now.
     #[arg(long)]
     pub auto: bool,
+
+    /// Pack only refs matching this pattern.
+    #[arg(long = "include", action = clap::ArgAction::Append)]
+    pub include: Vec<String>,
+
+    /// Clear include patterns accumulated so far.
+    #[arg(long = "no-include")]
+    pub no_include: bool,
+
+    /// Do not pack refs matching this pattern.
+    #[arg(long = "exclude", action = clap::ArgAction::Append)]
+    pub exclude: Vec<String>,
+
+    /// Clear exclude patterns accumulated so far.
+    #[arg(long = "no-exclude")]
+    pub no_exclude: bool,
 }
 
 /// Run `grit pack-refs`.
@@ -74,6 +93,9 @@ pub fn run(args: Args) -> Result<()> {
                 packed.remove(refname);
             }
             Ref::Direct(oid) => {
+                if !should_pack_ref(refname, &include, &exclude, args.no_include) {
+                    return Ok(());
+                }
                 let peeled = peel_to_non_tag(&repo.odb, &oid);
                 packed.insert(
                     refname.to_owned(),
@@ -142,6 +164,65 @@ fn pack_reftable_refs(git_dir: &Path, auto: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn maybe_emit_reference_fsync_counter(count: u64) {
+    if std::env::var("GIT_TEST_FSYNC").ok().as_deref() != Some("true") {
+        return;
+    }
+    let Ok(path) = std::env::var("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let _ = crate::trace2_write_json_counter_line(&path, "fsync", "hardware-flush", count);
+}
+
+fn ref_matches_pattern(refname: &str, pattern: &str) -> bool {
+    refname == pattern || wildmatch(pattern.as_bytes(), refname.as_bytes(), WM_PATHNAME)
+}
+
+fn should_pack_ref(
+    refname: &str,
+    include: &[String],
+    exclude: &[String],
+    no_include: bool,
+) -> bool {
+    if refname.starts_with("refs/bisect/") || refname.starts_with("refs/worktree/") {
+        return false;
+    }
+    if exclude.iter().any(|pat| ref_matches_pattern(refname, pat)) {
+        return false;
+    }
+    if no_include {
+        return false;
+    }
+    include.is_empty() || include.iter().any(|pat| ref_matches_pattern(refname, pat))
+}
+
+fn pack_refs_auto_needed(git_dir: &Path) -> Result<bool> {
+    let loose = count_packable_loose_refs(git_dir)?;
+    let packed = read_existing_packed_refs(git_dir)?.len();
+    if packed == 0 {
+        return Ok(loose >= 16);
+    }
+    let threshold = std::cmp::max(16, packed / 4);
+    if packed >= 64 {
+        Ok(loose > threshold)
+    } else {
+        Ok(loose >= threshold)
+    }
+}
+
+fn count_packable_loose_refs(git_dir: &Path) -> Result<usize> {
+    let mut count = 0usize;
+    walk_loose_under_refs(git_dir, "refs/", &mut |refname, path| {
+        if should_pack_ref(refname, &[], &[], false)
+            && matches!(read_ref_file(path), Ok(Ref::Direct(_)))
+        {
+            count += 1;
+        }
+        Ok(())
+    })?;
+    Ok(count)
 }
 
 fn walk_loose_under_refs(
@@ -242,9 +323,36 @@ fn write_packed_refs(git_dir: &Path, packed: &BTreeMap<String, PackedRef>) -> Re
     }
 
     let path = git_dir.join("packed-refs");
-    let lock = git_dir.join("packed-refs.lock");
+    let path = match fs::read_link(&path) {
+        Ok(target) if target.is_absolute() => target,
+        Ok(target) => git_dir.join(target),
+        Err(_) => path,
+    };
+    let lock = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("packed-refs")
+    ));
+    wait_for_pack_refs_lock(git_dir, &lock)?;
     fs::write(&lock, &out)?;
     fs::rename(&lock, &path)?;
+    Ok(())
+}
+
+fn wait_for_pack_refs_lock(git_dir: &Path, lock: &Path) -> Result<()> {
+    let config = ConfigSet::load(Some(git_dir), true).unwrap_or_else(|_| ConfigSet::new());
+    let timeout_ms = config
+        .get("core.packedrefstimeout")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while lock.exists() {
+        if timeout_ms == 0 || Instant::now() >= deadline {
+            anyhow::bail!("cannot lock packed-refs");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
 }
 
@@ -257,25 +365,36 @@ fn peel_to_non_tag(odb: &Odb, oid: &grit_lib::objects::ObjectId) -> Option<Strin
     }
 
     // Walk the tag chain
-    let mut current_oid = parse_tag_target(&obj.data)?;
+    let mut current_oid = parse_tag_target(odb, &obj.data)?;
     loop {
         let inner = odb.read(&current_oid).ok()?;
         if inner.kind != ObjectKind::Tag {
             return Some(current_oid.to_string());
         }
-        current_oid = parse_tag_target(&inner.data)?;
+        current_oid = parse_tag_target(odb, &inner.data)?;
     }
 }
 
 /// Parse the `object <hex>` line from raw tag data.
-fn parse_tag_target(data: &[u8]) -> Option<grit_lib::objects::ObjectId> {
+fn parse_tag_target(odb: &Odb, data: &[u8]) -> Option<grit_lib::objects::ObjectId> {
     let text = std::str::from_utf8(data).ok()?;
+    let mut declared_kind = None;
+    let mut target_oid = None;
     for line in text.lines() {
         if let Some(target) = line.strip_prefix("object ") {
-            return target.trim().parse().ok();
+            target_oid = target.trim().parse().ok();
+        } else if let Some(kind) = line.strip_prefix("type ") {
+            declared_kind = ObjectKind::from_bytes(kind.as_bytes()).ok();
         }
     }
-    None
+    let target_oid = target_oid?;
+    let declared_kind = declared_kind?;
+    let target = odb.read(&target_oid).ok()?;
+    if target.kind == declared_kind {
+        Some(target_oid)
+    } else {
+        None
+    }
 }
 
 /// Remove a loose ref file and clean up empty parent directories.

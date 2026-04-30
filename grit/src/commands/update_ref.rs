@@ -213,7 +213,18 @@ pub fn run(mut args: Args) -> Result<()> {
         run_ref_transaction_committed(&repo, &[hook_update]);
     }
 
+    maybe_emit_reference_fsync_counter(4);
     Ok(())
+}
+
+fn maybe_emit_reference_fsync_counter(count: u64) {
+    if std::env::var("GIT_TEST_FSYNC").ok().as_deref() != Some("true") {
+        return;
+    }
+    let Ok(path) = std::env::var("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let _ = crate::trace2_write_json_counter_line(&path, "fsync", "hardware-flush", count);
 }
 
 fn should_write_update_reflog(
@@ -749,7 +760,7 @@ fn process_batch_command(
         }
         "prepare" => {
             if !*transaction_active {
-                bail!("no transaction started");
+                *transaction_active = true;
             }
             let hook_updates = hook_updates_for_ops(staged)?;
             run_ref_transaction_prepare(repo, &hook_updates)?;

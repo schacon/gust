@@ -1513,6 +1513,18 @@ fn create_branch(
             heads_dir.join(name).display()
         );
     }
+    let descendant_prefix = format!("{refname}/");
+    if let Some((blocking, _)) = grit_lib::refs::list_refs(&repo.git_dir, &descendant_prefix)?
+        .into_iter()
+        .next()
+    {
+        bail!(
+            "cannot lock ref '{}': '{}' exists; cannot create '{}'",
+            refname,
+            blocking,
+            refname
+        );
+    }
 
     // Cannot force-update the current branch
     if args.force {
@@ -1603,7 +1615,18 @@ fn create_branch(
                 None => head.branch_name().unwrap_or("HEAD").to_string(),
             };
             let msg = format!("branch: Created from {from}");
-            if reflog_path.exists() {
+            if grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
+                let zero_oid = ObjectId::from_hex(zero)?;
+                let _ = grit_lib::refs::append_reflog(
+                    &repo.git_dir,
+                    &refname,
+                    &zero_oid,
+                    &oid,
+                    &ident,
+                    &msg,
+                    true,
+                );
+            } else if reflog_path.exists() {
                 if let Ok(entries) = grit_lib::reflog::read_reflog(&repo.git_dir, &refname) {
                     if let Some(last) = entries.last() {
                         if last.new_oid != oid {
@@ -1729,7 +1752,7 @@ fn should_log_ref_updates(repo: &Repository) -> bool {
             let lowered = v.trim().to_ascii_lowercase();
             lowered == "true" || lowered == "always"
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Delete one or more branches (`git branch -d a b` / `-D`).
@@ -1848,7 +1871,7 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
     if !args.quiet {
         let hex = branch_oid.to_hex();
         let short = &hex[..7.min(hex.len())];
-        eprintln!("Deleted branch {name} (was {short}).");
+        println!("Deleted branch {name} (was {short}).");
     }
 
     Ok(())
@@ -2185,14 +2208,29 @@ fn copy_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Copy reflog if exists
-    let reflog_dir = repo.git_dir.join("logs");
-    let src_log = reflog_dir.join(&src_ref);
-    let dst_log = reflog_dir.join(&dst_ref);
-    if src_log.exists() {
-        if let Some(parent) = dst_log.parent() {
-            let _ = fs::create_dir_all(parent);
+    if grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
+        if grit_lib::reflog::reflog_exists(&repo.git_dir, &src_ref) {
+            let mut entries = grit_lib::reflog::read_reflog(&repo.git_dir, &src_ref)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            entries.push(grit_lib::reflog::ReflogEntry {
+                old_oid: src_oid,
+                new_oid: src_oid,
+                identity: get_reflog_identity(),
+                message: format!("Branch: copied {src_ref} to {dst_ref}"),
+            });
+            grit_lib::reftable::reftable_replace_reflog(&repo.git_dir, &dst_ref, &entries)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        let _ = fs::copy(&src_log, &dst_log);
+    } else {
+        let reflog_dir = repo.git_dir.join("logs");
+        let src_log = reflog_dir.join(&src_ref);
+        let dst_log = reflog_dir.join(&dst_ref);
+        if src_log.exists() {
+            if let Some(parent) = dst_log.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::copy(&src_log, &dst_log);
+        }
     }
 
     // Copy config section

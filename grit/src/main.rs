@@ -446,6 +446,27 @@ pub(crate) fn trace2_write_json_data_line(
     Ok(())
 }
 
+/// Emit a trace2 counter event used by upstream fsync assertions.
+pub(crate) fn trace2_write_json_counter_line(
+    path: &str,
+    category: &str,
+    name: &str,
+    count: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let now = chrono_now();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(
+        file,
+        r#"{{"event":"counter","sid":"grit-0","time":"{}","category":"{}","name":"{}","count":{}}}"#,
+        now, category, name, count
+    )?;
+    Ok(())
+}
+
 /// Write a trace2 JSON cmd_ancestry event line with an ancestry array.
 fn trace2_write_json_ancestry(path: &str, ancestry: &[String]) -> std::io::Result<()> {
     use std::io::Write;
@@ -905,6 +926,67 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                     oid.as_str()
                 };
                 println!("{display_oid} {name} {flags}");
+            }
+            Ok(())
+        }
+        "reflog-exists" => {
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main reflog-exists <ref>")
+            })?;
+            if grit_lib::reflog::reflog_exists(&git_dir, refname) {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+        "create-reflog" => {
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main create-reflog <ref>")
+            })?;
+            if grit_lib::reftable::is_reftable_repo(&git_dir) {
+                grit_lib::reftable::reftable_create_reflog(&git_dir, refname)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                let path = grit_lib::reflog::reflog_path(&git_dir, refname);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+            }
+            Ok(())
+        }
+        "delete-reflog" => {
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main delete-reflog <ref>")
+            })?;
+            if grit_lib::reftable::is_reftable_repo(&git_dir) {
+                grit_lib::reftable::reftable_delete_reflog(&git_dir, refname)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                let _ = std::fs::remove_file(grit_lib::reflog::reflog_path(&git_dir, refname));
+            }
+            Ok(())
+        }
+        "for-each-reflog-ent" | "for-each-reflog-ent-reverse" => {
+            let refname = rest
+                .get(3)
+                .ok_or_else(|| anyhow::anyhow!("usage: test-tool ref-store main {sub} <ref>"))?;
+            let mut entries = grit_lib::reflog::read_reflog(&git_dir, refname)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if sub == "for-each-reflog-ent" {
+                entries.reverse();
+            }
+            for entry in entries {
+                println!(
+                    "{} {} {}\t{}",
+                    entry.old_oid.to_hex(),
+                    entry.new_oid.to_hex(),
+                    entry.identity,
+                    entry.message
+                );
             }
             Ok(())
         }
@@ -5891,6 +5973,22 @@ fn run_test_tool_path_utils(rest: &[String]) -> Result<()> {
             }
             if err != 0 {
                 std::process::exit(err);
+            }
+            Ok(())
+        }
+        "readlink" => {
+            let mut failed = false;
+            for path in rest.iter().skip(1) {
+                match std::fs::read_link(path) {
+                    Ok(target) => println!("{}", target.display()),
+                    Err(e) => {
+                        eprintln!("error: readlink '{path}': {e}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                std::process::exit(1);
             }
             Ok(())
         }

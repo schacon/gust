@@ -663,27 +663,31 @@ fn read_loose_ref_oid(
 
 fn parse_packed_refs(git_dir: &Path) -> Result<Vec<(String, ObjectId)>> {
     let path = git_dir.join("packed-refs");
-    let text = match fs::read_to_string(path) {
+    let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
     };
+    if !text.is_empty() && !text.ends_with('\n') {
+        let line = text.lines().last().unwrap_or("");
+        bail!("fatal: unterminated line in .git/packed-refs: {line}");
+    }
 
     let mut entries = Vec::new();
     for line in text.lines() {
         if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let Some(oid_str) = parts.next() else {
-            continue;
+        let Some((oid_str, name)) = line.split_once(' ') else {
+            bail!("fatal: unexpected line in .git/packed-refs: {line}");
         };
-        let Some(name) = parts.next() else {
-            continue;
-        };
-        if let Ok(oid) = oid_str.parse::<ObjectId>() {
-            entries.push((name.to_owned(), oid));
+        if oid_str.len() != 40 || name.trim().is_empty() || name.contains(char::is_whitespace) {
+            bail!("fatal: unexpected line in .git/packed-refs: {line}");
         }
+        let oid = oid_str
+            .parse::<ObjectId>()
+            .with_context(|| format!("fatal: unexpected line in .git/packed-refs: {line}"))?;
+        entries.push((name.trim().to_owned(), oid));
     }
     Ok(entries)
 }
