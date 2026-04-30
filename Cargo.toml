@@ -1,9 +1,9 @@
 [workspace]
-members = ["grit", "grit-lib", "git-cloud"]
+members = ["grit", "grit-lib"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 repository = "https://github.com/schacon/grit"
 
