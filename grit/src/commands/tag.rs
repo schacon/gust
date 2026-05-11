@@ -389,21 +389,14 @@ fn list_tags(
     no_contains: Option<&str>,
     points_at: Option<&str>,
 ) -> Result<()> {
-    let mut tags: Vec<(String, ObjectId)> = if grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
-        grit_lib::reftable::reftable_list_refs(&repo.git_dir, "refs/tags/")
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .into_iter()
-            .map(|(name, oid)| {
-                let short = name.strip_prefix("refs/tags/").unwrap_or(&name).to_owned();
-                (short, oid)
-            })
-            .collect()
-    } else {
-        let tags_dir = repo.git_dir.join("refs/tags");
-        let mut t = Vec::new();
-        collect_tags(&tags_dir, "", &mut t)?;
-        t
-    };
+    let mut tags: Vec<(String, ObjectId)> = grit_lib::refs::list_refs(&repo.git_dir, "refs/tags/")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .into_iter()
+        .map(|(name, oid)| {
+            let short = name.strip_prefix("refs/tags/").unwrap_or(&name).to_owned();
+            (short, oid)
+        })
+        .collect();
 
     // Filter by --contains
     if let Some(rev) = contains {
@@ -457,37 +450,6 @@ fn list_tags(
             }
         } else {
             writeln!(out, "{name}")?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Collect all tag refs recursively from the tags directory.
-fn collect_tags(dir: &Path, prefix: &str, out: &mut Vec<(String, ObjectId)>) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-
-    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    sorted.sort_by_key(|e| e.file_name());
-
-    for entry in sorted {
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let full_name = if prefix.is_empty() {
-            file_name
-        } else {
-            format!("{prefix}/{file_name}")
-        };
-
-        if path.is_dir() {
-            collect_tags(&path, &full_name, out)?;
-        } else if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(oid) = ObjectId::from_hex(content.trim()) {
-                out.push((full_name, oid));
-            }
         }
     }
 
