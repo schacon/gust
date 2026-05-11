@@ -406,6 +406,9 @@ pub fn run(args: Args) -> Result<()> {
         no_ipv6: false,
     };
     super::fetch::run(fetch_args)?;
+    if effective_refspecs.is_empty() {
+        normalize_fetch_head_for_pull_branch(&repo, &merge_branch)?;
+    }
 
     let kind = do_merge_or_rebase_after_fetch(&args, &config, &repo, &head)?;
     maybe_update_submodules_after_pull(&args, &config, kind)?;
@@ -535,6 +538,60 @@ fn merge_heads_from_fetch_head(repo: &Repository) -> Result<Vec<grit_lib::object
         bail!("FETCH_HEAD: no merge candidates");
     }
     Ok(out)
+}
+
+fn fetch_head_branch_name(line: &str) -> Option<&str> {
+    let start = line.find("branch '")? + "branch '".len();
+    let rest = &line[start..];
+    let end = rest.find('\'')?;
+    Some(&rest[..end])
+}
+
+fn fetch_head_line_parts(line: &str) -> Option<(&str, &str)> {
+    let first_tab = line.find('\t')?;
+    let oid = &line[..first_tab];
+    if oid.len() != 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rest = &line[first_tab + 1..];
+    let desc = rest
+        .strip_prefix("not-for-merge\t")
+        .or_else(|| rest.strip_prefix('\t'))
+        .unwrap_or(rest);
+    if desc.is_empty() {
+        return None;
+    }
+    Some((oid, desc))
+}
+
+fn normalize_fetch_head_for_pull_branch(repo: &Repository, merge_branch: &str) -> Result<()> {
+    let path = repo.git_dir.join("FETCH_HEAD");
+    let content = fs::read_to_string(&path).with_context(|| "could not read FETCH_HEAD")?;
+    let mut found_branch = false;
+    let mut changed = false;
+    let mut lines = Vec::new();
+
+    for line in content.lines() {
+        let Some((oid, desc)) = fetch_head_line_parts(line) else {
+            lines.push(line.to_owned());
+            continue;
+        };
+        let normalized = if fetch_head_branch_name(line) == Some(merge_branch) {
+            found_branch = true;
+            format!("{oid}\t\t{desc}")
+        } else {
+            format!("{oid}\tnot-for-merge\t{desc}")
+        };
+        if normalized != line {
+            changed = true;
+        }
+        lines.push(normalized);
+    }
+
+    if found_branch && changed {
+        fs::write(&path, lines.join("\n") + "\n").context("writing FETCH_HEAD")?;
+    }
+    Ok(())
 }
 
 fn pull_can_fast_forward(

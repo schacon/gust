@@ -311,8 +311,31 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
     let skip_default_templates = matches!(&args.template, Some(t) if t.is_empty())
         || (args.template.is_none() && std::env::var_os("TEST_CREATE_REPO_NO_TEMPLATE").is_some());
 
-    // Determine ref format
-    let ref_format = args.ref_format.as_deref().unwrap_or("files");
+    // Determine ref format. On reinit, an omitted format preserves the existing backend even if
+    // default-format environment/config would choose a different one.
+    let existing_ref_format = is_reinit.then(|| detect_ref_format(&real_git_dir));
+    let env_ref_format = std::env::var("GIT_DEFAULT_REF_FORMAT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("GIT_TEST_DEFAULT_REF_FORMAT")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
+    let configured_ref_format = config.get("init.defaultRefFormat");
+    let ref_format_owned;
+    let ref_format = if let Some(format) = args.ref_format.as_deref() {
+        format
+    } else if let Some(format) = existing_ref_format {
+        format
+    } else if let Some(format) = env_ref_format.as_deref() {
+        format
+    } else if let Some(format) = configured_ref_format.as_deref() {
+        ref_format_owned = format.to_owned();
+        &ref_format_owned
+    } else {
+        "files"
+    };
     match ref_format {
         "files" | "reftable" => {}
         other => bail!("unknown ref storage format: {other}"),
@@ -492,6 +515,16 @@ fn create_git_dir(git_dir: &Path, opts: CreateGitDirOptions<'_>) -> Result<()> {
         let tables_list = reftable_dir.join("tables.list");
         if !tables_list.exists() {
             fs::write(&tables_list, "")?;
+        }
+        if !is_reinit && fs::read_to_string(&tables_list)?.trim().is_empty() {
+            let writer = grit_lib::reftable::ReftableWriter::new(
+                grit_lib::reftable::WriteOptions::default(),
+                1,
+                1,
+            );
+            let table = writer.finish()?;
+            let mut stack = grit_lib::reftable::ReftableStack::open(git_dir)?;
+            stack.add_table(&table, 1)?;
         }
     }
 

@@ -446,6 +446,27 @@ pub(crate) fn trace2_write_json_data_line(
     Ok(())
 }
 
+/// Emit a trace2 counter event used by upstream fsync assertions.
+pub(crate) fn trace2_write_json_counter_line(
+    path: &str,
+    category: &str,
+    name: &str,
+    count: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let now = chrono_now();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(
+        file,
+        r#"{{"event":"counter","sid":"grit-0","time":"{}","category":"{}","name":"{}","count":{}}}"#,
+        now, category, name, count
+    )?;
+    Ok(())
+}
+
 /// Write a trace2 JSON cmd_ancestry event line with an ancestry array.
 fn trace2_write_json_ancestry(path: &str, ancestry: &[String]) -> std::io::Result<()> {
     use std::io::Write;
@@ -828,6 +849,8 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             let old_oid = &rest[6];
             let flags = if rest.len() > 7 { &rest[7..] } else { &[] };
             let skip_oid_verification = flags.iter().any(|f| f == "REF_SKIP_OID_VERIFICATION");
+            let skip_refname_verification =
+                flags.iter().any(|f| f == "REF_SKIP_REFNAME_VERIFICATION");
 
             let mut args = vec![
                 "update-ref".to_owned(),
@@ -839,15 +862,133 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             if old_oid != "0000000000000000000000000000000000000000" {
                 args.push(old_oid.clone());
             }
-            if skip_oid_verification {
-                let ref_path = git_dir.join(refname);
-                if let Some(parent) = ref_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+            if skip_oid_verification || skip_refname_verification {
+                let oid = grit_lib::objects::ObjectId::from_hex(new_oid)
+                    .with_context(|| format!("invalid object id '{new_oid}'"))?;
+                if grit_lib::reftable::is_reftable_repo(&git_dir) {
+                    grit_lib::reftable::reftable_write_ref(&git_dir, refname, &oid, None, None)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                } else {
+                    let ref_path = git_dir.join(refname);
+                    if let Some(parent) = ref_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(ref_path, format!("{new_oid}\n"))?;
                 }
-                std::fs::write(ref_path, format!("{new_oid}\n"))?;
                 return Ok(());
             }
             dispatch("update-ref", &args, &GlobalOpts::default())
+        }
+        "for-each-ref" => {
+            let prefix = rest.get(3).map(String::as_str).unwrap_or("");
+            let mut refs = if grit_lib::reftable::is_reftable_repo(&git_dir) {
+                grit_lib::reftable::ReftableStack::open(&git_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .read_refs()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .into_iter()
+                    .filter_map(|record| match record.value {
+                        grit_lib::reftable::RefValue::Val1(oid)
+                        | grit_lib::reftable::RefValue::Val2(oid, _) => {
+                            Some((record.name, oid.to_hex()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                grit_lib::refs::list_refs(&git_dir, prefix)?
+                    .into_iter()
+                    .map(|(name, oid)| (name, oid.to_hex()))
+                    .collect::<Vec<_>>()
+            };
+            refs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, oid) in refs {
+                if !prefix.is_empty() && !name.starts_with(prefix) {
+                    continue;
+                }
+                let flags = if grit_lib::check_ref_format::check_refname_format(
+                    &name,
+                    &grit_lib::check_ref_format::RefNameOptions {
+                        allow_onelevel: false,
+                        refspec_pattern: false,
+                        normalize: false,
+                    },
+                )
+                .is_err()
+                {
+                    "0xc"
+                } else {
+                    "0x0"
+                };
+                let display_oid = if flags == "0xc" {
+                    "0000000000000000000000000000000000000000"
+                } else {
+                    oid.as_str()
+                };
+                println!("{display_oid} {name} {flags}");
+            }
+            Ok(())
+        }
+        "reflog-exists" => {
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main reflog-exists <ref>")
+            })?;
+            if grit_lib::reflog::reflog_exists(&git_dir, refname) {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+        "create-reflog" => {
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main create-reflog <ref>")
+            })?;
+            if grit_lib::reftable::is_reftable_repo(&git_dir) {
+                grit_lib::reftable::reftable_create_reflog(&git_dir, refname)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                let path = grit_lib::reflog::reflog_path(&git_dir, refname);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+            }
+            Ok(())
+        }
+        "delete-reflog" => {
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main delete-reflog <ref>")
+            })?;
+            if grit_lib::reftable::is_reftable_repo(&git_dir) {
+                grit_lib::reftable::reftable_delete_reflog(&git_dir, refname)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                let _ = std::fs::remove_file(grit_lib::reflog::reflog_path(&git_dir, refname));
+            }
+            Ok(())
+        }
+        "for-each-reflog-ent" | "for-each-reflog-ent-reverse" => {
+            let refname = rest
+                .get(3)
+                .ok_or_else(|| anyhow::anyhow!("usage: test-tool ref-store main {sub} <ref>"))?;
+            let mut entries = grit_lib::reflog::read_reflog(&git_dir, refname)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if sub == "for-each-reflog-ent" {
+                entries.reverse();
+            }
+            for entry in entries {
+                println!(
+                    "{} {} {}\t{}",
+                    entry.old_oid.to_hex(),
+                    entry.new_oid.to_hex(),
+                    entry.identity,
+                    entry.message
+                );
+            }
+            Ok(())
         }
         other => bail!("test-tool ref-store: unsupported subcommand '{other}'"),
     }
@@ -5559,6 +5700,23 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
                     }
                     Ok(())
                 }
+                "truncate" => {
+                    let path = rest.get(1).ok_or_else(|| {
+                        anyhow::anyhow!("usage: test-tool truncate <file> <size>")
+                    })?;
+                    let size = rest
+                        .get(2)
+                        .ok_or_else(|| anyhow::anyhow!("usage: test-tool truncate <file> <size>"))?
+                        .parse::<u64>()
+                        .with_context(|| format!("invalid truncate size '{}'", rest[2]))?;
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .with_context(|| format!("open {path}"))?;
+                    file.set_len(size)
+                        .with_context(|| format!("truncate {path}"))?;
+                    Ok(())
+                }
                 "bundle-uri" => {
                     let sub = rest.get(1).map(|s| s.as_str()).unwrap_or("");
                     match sub {
@@ -5815,6 +5973,22 @@ fn run_test_tool_path_utils(rest: &[String]) -> Result<()> {
             }
             if err != 0 {
                 std::process::exit(err);
+            }
+            Ok(())
+        }
+        "readlink" => {
+            let mut failed = false;
+            for path in rest.iter().skip(1) {
+                match std::fs::read_link(path) {
+                    Ok(target) => println!("{}", target.display()),
+                    Err(e) => {
+                        eprintln!("error: readlink '{path}': {e}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                std::process::exit(1);
             }
             Ok(())
         }

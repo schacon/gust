@@ -238,18 +238,20 @@ fn create_lightweight_tag(
         grit_lib::refs::resolve_ref(&repo.git_dir, &refname).unwrap_or_else(|_| zero_oid());
     grit_lib::refs::write_ref(&repo.git_dir, &refname, &target_oid)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let config = ConfigSet::load(Some(&repo.git_dir), true)?;
-    let ident = resolve_tagger(&config, OffsetDateTime::now_utc())?;
-    let msg = format!("tag: {name}");
-    let _ = append_reflog(
-        &repo.git_dir,
-        &refname,
-        &old_oid,
-        &target_oid,
-        &ident,
-        &msg,
-        args.create_reflog,
-    );
+    if args.create_reflog {
+        let config = ConfigSet::load(Some(&repo.git_dir), true)?;
+        let ident = resolve_tagger(&config, OffsetDateTime::now_utc())?;
+        let msg = format!("tag: {name}");
+        let _ = append_reflog(
+            &repo.git_dir,
+            &refname,
+            &old_oid,
+            &target_oid,
+            &ident,
+            &msg,
+            args.create_reflog,
+        );
+    }
     Ok(())
 }
 
@@ -314,16 +316,18 @@ fn create_annotated_tag(
         grit_lib::refs::resolve_ref(&repo.git_dir, &refname).unwrap_or_else(|_| zero_oid());
     grit_lib::refs::write_ref(&repo.git_dir, &refname, &tag_oid)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let msg = format!("tag: {name}");
-    let _ = append_reflog(
-        &repo.git_dir,
-        &refname,
-        &old_oid,
-        &tag_oid,
-        &tagger,
-        &msg,
-        args.create_reflog,
-    );
+    if args.create_reflog {
+        let msg = format!("tag: {name}");
+        let _ = append_reflog(
+            &repo.git_dir,
+            &refname,
+            &old_oid,
+            &tag_oid,
+            &tagger,
+            &msg,
+            args.create_reflog,
+        );
+    }
     Ok(())
 }
 

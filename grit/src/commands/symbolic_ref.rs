@@ -159,6 +159,11 @@ fn read_symbolic_ref_target_maybe_missing(
     // Reftable backend: check reftable stack for symrefs
     if grit_lib::reftable::is_reftable_repo(git_dir) {
         // HEAD is still a file even in reftable repos
+        if name == "HEAD" {
+            if let Ok(Ref::Symbolic(target)) = read_ref_file(&git_dir.join("refs").join("heads")) {
+                return Ok(Some(target));
+            }
+        }
         if name != "HEAD" {
             match grit_lib::reftable::reftable_read_symbolic_ref(git_dir, name)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -238,7 +243,7 @@ fn check_ref_df_conflict(repo: &Repository, name: &str) -> Result<()> {
     let all_refs = grit_lib::refs::list_refs(&repo.git_dir, "refs/").unwrap_or_default();
     for (refname, _) in &all_refs {
         if refname.starts_with(&prefix_with_slash) {
-            bail!("'{name}' exists as a directory; cannot create it");
+            bail!("'{refname}' exists; cannot create '{name}'");
         }
     }
     Ok(())

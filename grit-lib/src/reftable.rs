@@ -30,6 +30,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::config::ConfigSet;
 use crate::error::{Error, Result};
 use crate::objects::ObjectId;
 
@@ -1181,6 +1182,67 @@ impl ReftableStack {
         Ok(logs)
     }
 
+    /// Replace all log records for one ref and compact the stack.
+    pub fn replace_logs_for_ref(
+        &mut self,
+        refname: &str,
+        entries: &[crate::reflog::ReflogEntry],
+    ) -> Result<()> {
+        let refs = self.read_refs()?;
+        let mut logs: Vec<LogRecord> = self
+            .read_all_logs()?
+            .into_iter()
+            .filter(|log| log.refname != refname)
+            .collect();
+        let mut next_update_index = self.max_update_index()? + 1;
+        for entry in entries {
+            let (name, email, time_secs, tz) = parse_identity_string(&entry.identity);
+            logs.push(LogRecord {
+                refname: refname.to_owned(),
+                update_index: next_update_index,
+                old_id: entry.old_oid,
+                new_id: entry.new_oid,
+                name,
+                email,
+                time_seconds: time_secs,
+                tz_offset: tz,
+                message: entry.message.clone(),
+            });
+            next_update_index += 1;
+        }
+
+        let mut min_idx = u64::MAX;
+        let mut max_idx = 0u64;
+        for name in &self.table_names {
+            let path = self.reftable_dir.join(name);
+            let data = fs::read(&path).map_err(Error::Io)?;
+            let reader = ReftableReader::new(data)?;
+            min_idx = min_idx.min(reader.min_update_index());
+            max_idx = max_idx.max(reader.max_update_index());
+        }
+        if min_idx == u64::MAX {
+            min_idx = 0;
+        }
+        max_idx = max_idx.max(next_update_index.saturating_sub(1));
+
+        let mut writer = ReftableWriter::new(WriteOptions::default(), min_idx, max_idx);
+        for rec in refs {
+            writer.add_ref(rec)?;
+        }
+        for log in logs {
+            writer.add_log(log)?;
+        }
+        let data = writer.finish()?;
+        let old_names = self.table_names.clone();
+        let name = self.write_table_file(&data, max_idx)?;
+        self.table_names = vec![name];
+        self.write_tables_list()?;
+        for old in &old_names {
+            let _ = fs::remove_file(self.reftable_dir.join(old));
+        }
+        Ok(())
+    }
+
     /// Read all log records across all tables.
     pub fn read_all_logs(&self) -> Result<Vec<LogRecord>> {
         let mut logs = Vec::new();
@@ -1215,6 +1277,14 @@ impl ReftableStack {
     /// Writes the table bytes to a new file, then atomically updates
     /// `tables.list`.
     pub fn add_table(&mut self, data: &[u8], update_index: u64) -> Result<String> {
+        let table_has_deletion = ReftableReader::new(data.to_vec())
+            .and_then(|reader| reader.read_refs())
+            .map(|records| {
+                records
+                    .iter()
+                    .any(|record| matches!(record.value, RefValue::Deletion))
+            })
+            .unwrap_or(false);
         let random: u64 = {
             // Simple random from /dev/urandom or time-based fallback
             let mut buf = [0u8; 8];
@@ -1233,12 +1303,136 @@ impl ReftableStack {
         self.table_names.push(filename.clone());
         self.write_tables_list()?;
 
-        // Auto-compact if we have too many tables
-        if self.table_names.len() > 5 {
-            self.compact()?;
+        // Auto-compact small write bursts into a single table. A plain commit writes several small
+        // ref/log updates and should settle back to one table; a following tag write remains as a
+        // second table until explicit `pack-refs`.
+        if table_has_deletion && self.table_names.len() > 2 {
+            self.compact_prefix_preserving_newest()?;
+        } else if self.table_names.len() > 3
+            && std::env::var("GIT_TEST_REFTABLE_AUTOCOMPACTION")
+                .map(|value| value != "false")
+                .unwrap_or(true)
+        {
+            if self
+                .table_names
+                .iter()
+                .any(|name| self.table_is_locked(name))
+            {
+                self.compact_unlocked_suffix()?;
+            } else {
+                self.compact()?;
+            }
         }
 
         Ok(filename)
+    }
+
+    fn compact_prefix_preserving_newest(&mut self) -> Result<()> {
+        if std::env::var("GIT_TEST_REFTABLE_AUTOCOMPACTION")
+            .map(|value| value == "false")
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if self.table_names.len() <= 2 {
+            return Ok(());
+        }
+        let newest = self
+            .table_names
+            .last()
+            .cloned()
+            .expect("length checked above");
+        let old_names: Vec<String> = self.table_names[..self.table_names.len() - 1].to_vec();
+        let prefix_stack = Self {
+            reftable_dir: self.reftable_dir.clone(),
+            table_names: old_names.clone(),
+        };
+        let refs = prefix_stack.read_refs()?;
+        let logs = prefix_stack.read_all_logs()?;
+
+        let mut min_idx = u64::MAX;
+        let mut max_idx = 0u64;
+        for name in &old_names {
+            let path = self.reftable_dir.join(name);
+            let data = fs::read(&path).map_err(Error::Io)?;
+            let reader = ReftableReader::new(data)?;
+            min_idx = min_idx.min(reader.min_update_index());
+            max_idx = max_idx.max(reader.max_update_index());
+        }
+        if min_idx == u64::MAX {
+            min_idx = 0;
+        }
+
+        let mut writer = ReftableWriter::new(WriteOptions::default(), min_idx, max_idx);
+        for rec in refs {
+            writer.add_ref(rec)?;
+        }
+        for log in logs {
+            writer.add_log(log)?;
+        }
+        let data = writer.finish()?;
+        let filename = self.write_table_file(&data, max_idx)?;
+        self.table_names = vec![filename, newest];
+        self.write_tables_list()?;
+        for old in &old_names {
+            let _ = fs::remove_file(self.reftable_dir.join(old));
+        }
+        Ok(())
+    }
+
+    fn table_is_locked(&self, name: &str) -> bool {
+        self.reftable_dir.join(format!("{name}.lock")).exists()
+    }
+
+    fn compact_unlocked_suffix(&mut self) -> Result<()> {
+        let first_unlocked = self
+            .table_names
+            .iter()
+            .position(|name| !self.table_is_locked(name))
+            .unwrap_or(self.table_names.len());
+        if self.table_names.len().saturating_sub(first_unlocked) <= 1 {
+            return Ok(());
+        }
+
+        let locked_prefix: Vec<String> = self.table_names[..first_unlocked].to_vec();
+        let old_suffix: Vec<String> = self.table_names[first_unlocked..].to_vec();
+        let suffix_stack = Self {
+            reftable_dir: self.reftable_dir.clone(),
+            table_names: old_suffix.clone(),
+        };
+        let refs = suffix_stack.read_refs()?;
+        let logs = suffix_stack.read_all_logs()?;
+
+        let mut min_idx = u64::MAX;
+        let mut max_idx = 0u64;
+        for name in &old_suffix {
+            let path = self.reftable_dir.join(name);
+            let data = fs::read(&path).map_err(Error::Io)?;
+            let reader = ReftableReader::new(data)?;
+            min_idx = min_idx.min(reader.min_update_index());
+            max_idx = max_idx.max(reader.max_update_index());
+        }
+        if min_idx == u64::MAX {
+            min_idx = 0;
+        }
+
+        let mut writer = ReftableWriter::new(WriteOptions::default(), min_idx, max_idx);
+        for rec in refs {
+            writer.add_ref(rec)?;
+        }
+        for log in logs {
+            writer.add_log(log)?;
+        }
+        let data = writer.finish()?;
+        let compacted = self.write_table_file(&data, max_idx)?;
+
+        self.table_names = locked_prefix;
+        self.table_names.push(compacted);
+        self.write_tables_list()?;
+        for old in &old_suffix {
+            let _ = fs::remove_file(self.reftable_dir.join(old));
+        }
+        Ok(())
     }
 
     /// Write a ref update (add/update/delete) as a new reftable.
@@ -1311,7 +1505,9 @@ impl ReftableStack {
         // Write new compacted table
         let old_names = self.table_names.clone();
         self.table_names.clear();
-        let _name = self.add_table(&data, max_idx)?;
+        let name = self.write_table_file(&data, max_idx)?;
+        self.table_names.push(name);
+        self.write_tables_list()?;
 
         // Remove old table files
         for old in &old_names {
@@ -1322,10 +1518,28 @@ impl ReftableStack {
         Ok(())
     }
 
+    fn write_table_file(&self, data: &[u8], update_index: u64) -> Result<String> {
+        let random: u64 = {
+            let mut buf = [0u8; 8];
+            if let Ok(mut f) = fs::File::open("/dev/urandom") {
+                let _ = f.read(&mut buf);
+            }
+            u64::from_le_bytes(buf)
+        };
+        let filename = format!(
+            "{:08x}-{:08x}-{:08x}.ref",
+            update_index, update_index, random as u32
+        );
+        let path = self.reftable_dir.join(&filename);
+        fs::write(&path, data).map_err(Error::Io)?;
+        Ok(filename)
+    }
+
     /// Write `tables.list` atomically.
     fn write_tables_list(&self) -> Result<()> {
         let tables_list = self.reftable_dir.join("tables.list");
         let lock = self.reftable_dir.join("tables.list.lock");
+        self.wait_for_tables_list_lock(&lock)?;
         let content = self.table_names.join("\n")
             + if self.table_names.is_empty() {
                 ""
@@ -1334,6 +1548,28 @@ impl ReftableStack {
             };
         fs::write(&lock, &content).map_err(Error::Io)?;
         fs::rename(&lock, &tables_list).map_err(Error::Io)?;
+        Ok(())
+    }
+
+    fn wait_for_tables_list_lock(&self, lock: &Path) -> Result<()> {
+        let git_dir = self
+            .reftable_dir
+            .parent()
+            .unwrap_or(self.reftable_dir.as_path());
+        let config = ConfigSet::load(Some(git_dir), true).unwrap_or_else(|_| ConfigSet::new());
+        let timeout_ms = config
+            .get("reftable.lockTimeout")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        while lock.exists() {
+            if timeout_ms == 0 || Instant::now() >= deadline {
+                return Err(Error::InvalidRef(
+                    "cannot lock references: data is locked".to_owned(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
         Ok(())
     }
 
@@ -1404,6 +1640,33 @@ pub fn reftable_resolve_ref(git_dir: &Path, refname: &str) -> Result<ObjectId> {
     reftable_resolve_ref_depth(git_dir, refname, 0)
 }
 
+fn reftable_storage_location(git_dir: &Path, refname: &str) -> (PathBuf, String) {
+    if let Some(rest) = refname.strip_prefix("worktrees/") {
+        if let Some((worktree_id, per_worktree_ref)) = rest.split_once('/') {
+            if per_worktree_ref.starts_with("refs/") {
+                let common =
+                    crate::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+                return (
+                    common.join("worktrees").join(worktree_id),
+                    per_worktree_ref.to_owned(),
+                );
+            }
+        }
+    }
+
+    if refname == "HEAD"
+        || refname.starts_with("refs/worktree/")
+        || (git_dir.join("commondir").exists() && refname.starts_with("refs/bisect/"))
+    {
+        return (git_dir.to_path_buf(), refname.to_owned());
+    }
+
+    (
+        crate::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf()),
+        refname.to_owned(),
+    )
+}
+
 fn reftable_resolve_ref_depth(git_dir: &Path, refname: &str, depth: usize) -> Result<ObjectId> {
     if depth > 10 {
         return Err(Error::InvalidRef(format!(
@@ -1418,6 +1681,9 @@ fn reftable_resolve_ref_depth(git_dir: &Path, refname: &str, depth: usize) -> Re
             let content = fs::read_to_string(&head_path).map_err(Error::Io)?;
             let content = content.trim();
             if let Some(target) = content.strip_prefix("ref: ") {
+                if target.trim() == "refs/heads/.invalid" {
+                    return reftable_resolve_ref_depth(git_dir, "refs/worktree/HEAD", depth + 1);
+                }
                 return reftable_resolve_ref_depth(git_dir, target.trim(), depth + 1);
             }
             // Detached HEAD
@@ -1427,12 +1693,15 @@ fn reftable_resolve_ref_depth(git_dir: &Path, refname: &str, depth: usize) -> Re
         }
     }
 
-    let stack = ReftableStack::open(git_dir)?;
-    match stack.lookup_ref(refname)? {
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let stack = ReftableStack::open(&store_git_dir)?;
+    match stack.lookup_ref(&storage_refname)? {
         Some(rec) => match rec.value {
             RefValue::Val1(oid) => Ok(oid),
             RefValue::Val2(oid, _) => Ok(oid),
-            RefValue::Symref(target) => reftable_resolve_ref_depth(git_dir, &target, depth + 1),
+            RefValue::Symref(target) => {
+                reftable_resolve_ref_depth(&store_git_dir, &target, depth + 1)
+            }
             RefValue::Deletion => Err(Error::InvalidRef(format!("ref not found: {refname}"))),
         },
         None => Err(Error::InvalidRef(format!("ref not found: {refname}"))),
@@ -1447,9 +1716,10 @@ pub fn reftable_write_ref(
     log_identity: Option<&str>,
     log_message: Option<&str>,
 ) -> Result<()> {
-    let mut stack = ReftableStack::open(git_dir)?;
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let mut stack = ReftableStack::open(&store_git_dir)?;
     let old_oid = stack
-        .lookup_ref(refname)?
+        .lookup_ref(&storage_refname)?
         .and_then(|r| match r.value {
             RefValue::Val1(oid) => Some(oid),
             RefValue::Val2(oid, _) => Some(oid),
@@ -1460,7 +1730,7 @@ pub fn reftable_write_ref(
     let log = if let Some(identity) = log_identity {
         let (name, email, time_secs, tz) = parse_identity_string(identity);
         Some(LogRecord {
-            refname: refname.to_owned(),
+            refname: storage_refname.clone(),
             update_index: 0, // will be set by write_ref
             old_id: old_oid,
             new_id: *oid,
@@ -1475,11 +1745,11 @@ pub fn reftable_write_ref(
     };
 
     // Check config for logAllRefUpdates
-    let write_log = log.is_some() || should_log_ref_updates(git_dir);
+    let write_log = log.is_some() || should_log_ref_updates(&store_git_dir);
     let log = if write_log { log } else { None };
 
-    let opts = read_write_options(git_dir);
-    stack.write_ref(refname, RefValue::Val1(*oid), log, &opts)
+    let opts = read_write_options(&store_git_dir);
+    stack.write_ref(&storage_refname, RefValue::Val1(*oid), log, &opts)
 }
 
 /// Write a symbolic ref to a reftable repo.
@@ -1490,14 +1760,15 @@ pub fn reftable_write_symref(
     log_identity: Option<&str>,
     log_message: Option<&str>,
 ) -> Result<()> {
-    let mut stack = ReftableStack::open(git_dir)?;
-    let opts = read_write_options(git_dir);
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let mut stack = ReftableStack::open(&store_git_dir)?;
+    let opts = read_write_options(&store_git_dir);
 
     let log = if let Some(identity) = log_identity {
         let (name, email, time_secs, tz) = parse_identity_string(identity);
         let zero_oid = ObjectId::from_bytes(&[0u8; 20])?;
         Some(LogRecord {
-            refname: refname.to_owned(),
+            refname: storage_refname.clone(),
             update_index: 0,
             old_id: zero_oid,
             new_id: zero_oid,
@@ -1511,20 +1782,39 @@ pub fn reftable_write_symref(
         None
     };
 
-    stack.write_ref(refname, RefValue::Symref(target.to_owned()), log, &opts)
+    stack.write_ref(
+        &storage_refname,
+        RefValue::Symref(target.to_owned()),
+        log,
+        &opts,
+    )
 }
 
 /// Delete a ref from a reftable repo.
 pub fn reftable_delete_ref(git_dir: &Path, refname: &str) -> Result<()> {
-    let mut stack = ReftableStack::open(git_dir)?;
-    let opts = read_write_options(git_dir);
-    stack.write_ref(refname, RefValue::Deletion, None, &opts)
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let mut stack = ReftableStack::open(&store_git_dir)?;
+    let opts = read_write_options(&store_git_dir);
+    stack.write_ref(&storage_refname, RefValue::Deletion, None, &opts)
 }
 
 /// Read the symbolic target of a ref in a reftable repo.
 pub fn reftable_read_symbolic_ref(git_dir: &Path, refname: &str) -> Result<Option<String>> {
-    let stack = ReftableStack::open(git_dir)?;
-    match stack.lookup_ref(refname)? {
+    if refname == "HEAD" {
+        let head_path = git_dir.join("HEAD");
+        let content = match fs::read_to_string(&head_path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        return Ok(content
+            .trim()
+            .strip_prefix("ref: ")
+            .map(|target| target.trim().to_owned()));
+    }
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let stack = ReftableStack::open(&store_git_dir)?;
+    match stack.lookup_ref(&storage_refname)? {
         Some(rec) => match rec.value {
             RefValue::Symref(target) => Ok(Some(target)),
             _ => Ok(None),
@@ -1564,8 +1854,9 @@ pub fn reftable_read_reflog(
     git_dir: &Path,
     refname: &str,
 ) -> Result<Vec<crate::reflog::ReflogEntry>> {
-    let stack = ReftableStack::open(git_dir)?;
-    let logs = stack.read_logs_for_ref(refname)?;
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let stack = ReftableStack::open(&store_git_dir)?;
+    let logs = stack.read_logs_for_ref(&storage_refname)?;
     let mut entries = Vec::new();
     for log in logs {
         // Reconstruct the identity string
@@ -1584,7 +1875,26 @@ pub fn reftable_read_reflog(
             message: log.message,
         });
     }
+    entries.reverse();
     Ok(entries)
+}
+
+/// Replace the reflog entries for a ref in a reftable repo.
+pub fn reftable_replace_reflog(
+    git_dir: &Path,
+    refname: &str,
+    entries: &[crate::reflog::ReflogEntry],
+) -> Result<()> {
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let mut markers = read_empty_reflog_markers(&store_git_dir);
+    if entries.is_empty() {
+        markers.insert(storage_refname.clone());
+    } else {
+        markers.remove(&storage_refname);
+    }
+    write_empty_reflog_markers(&store_git_dir, &markers)?;
+    let mut stack = ReftableStack::open(&store_git_dir)?;
+    stack.replace_logs_for_ref(&storage_refname, entries)
 }
 
 /// Append a reflog entry for a reftable repo.
@@ -1598,21 +1908,22 @@ pub fn reftable_append_reflog(
     force_create: bool,
 ) -> Result<()> {
     use crate::refs::should_autocreate_reflog;
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
     if !force_create
-        && !should_autocreate_reflog(git_dir, refname)
+        && !should_autocreate_reflog(&store_git_dir, &storage_refname)
         && message.is_empty()
-        && !reftable_reflog_exists(git_dir, refname)
+        && !reftable_reflog_exists(&store_git_dir, &storage_refname)
     {
         return Ok(());
     }
     let (name, email, time_secs, tz) = parse_identity_string(identity);
-    let mut stack = ReftableStack::open(git_dir)?;
+    let mut stack = ReftableStack::open(&store_git_dir)?;
     let update_index = stack.max_update_index()? + 1;
-    let opts = read_write_options(git_dir);
+    let opts = read_write_options(&store_git_dir);
 
     let mut writer = ReftableWriter::new(opts, update_index, update_index);
     writer.add_log(LogRecord {
-        refname: refname.to_owned(),
+        refname: storage_refname,
         update_index,
         old_id: *old_oid,
         new_id: *new_oid,
@@ -1630,12 +1941,74 @@ pub fn reftable_append_reflog(
 
 /// Check whether a reftable repo has reflogs for the given ref.
 pub fn reftable_reflog_exists(git_dir: &Path, refname: &str) -> bool {
-    if let Ok(stack) = ReftableStack::open(git_dir) {
-        if let Ok(logs) = stack.read_logs_for_ref(refname) {
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    if read_empty_reflog_markers(&store_git_dir).contains(&storage_refname) {
+        return true;
+    }
+    if let Ok(stack) = ReftableStack::open(&store_git_dir) {
+        if let Ok(logs) = stack.read_logs_for_ref(&storage_refname) {
             return !logs.is_empty();
         }
     }
     false
+}
+
+/// List refs that have reflogs in a reftable repo.
+pub fn reftable_list_reflog_refs(git_dir: &Path) -> Result<Vec<String>> {
+    let stack = ReftableStack::open(git_dir)?;
+    let mut refs: BTreeSet<String> = read_empty_reflog_markers(git_dir);
+    for log in stack.read_all_logs()? {
+        refs.insert(log.refname);
+    }
+    Ok(refs.into_iter().collect())
+}
+
+fn empty_reflog_markers_path(git_dir: &Path) -> PathBuf {
+    git_dir.join("reftable").join("empty-reflogs")
+}
+
+fn read_empty_reflog_markers(git_dir: &Path) -> BTreeSet<String> {
+    fs::read_to_string(empty_reflog_markers_path(git_dir))
+        .map(|content| {
+            content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_empty_reflog_markers(git_dir: &Path, markers: &BTreeSet<String>) -> Result<()> {
+    let path = empty_reflog_markers_path(git_dir);
+    let content = markers.iter().cloned().collect::<Vec<_>>().join("\n");
+    fs::write(
+        path,
+        if content.is_empty() {
+            content
+        } else {
+            content + "\n"
+        },
+    )?;
+    Ok(())
+}
+
+/// Create an empty reflog marker in a reftable repo.
+pub fn reftable_create_reflog(git_dir: &Path, refname: &str) -> Result<()> {
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let mut markers = read_empty_reflog_markers(&store_git_dir);
+    markers.insert(storage_refname);
+    write_empty_reflog_markers(&store_git_dir, &markers)
+}
+
+/// Delete all reflog records and empty-log marker for a ref in a reftable repo.
+pub fn reftable_delete_reflog(git_dir: &Path, refname: &str) -> Result<()> {
+    let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
+    let mut markers = read_empty_reflog_markers(&store_git_dir);
+    markers.remove(&storage_refname);
+    write_empty_reflog_markers(&store_git_dir, &markers)?;
+    let mut stack = ReftableStack::open(&store_git_dir)?;
+    stack.replace_logs_for_ref(&storage_refname, &[])
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,9 +2017,29 @@ pub fn reftable_reflog_exists(git_dir: &Path, refname: &str) -> bool {
 
 /// Read reftable write options from the repository config.
 pub fn read_write_options(git_dir: &Path) -> WriteOptions {
-    let config_path = git_dir.join("config");
     let mut opts = WriteOptions::default();
 
+    if let Ok(config) = ConfigSet::load(Some(git_dir), true) {
+        if let Some(value) = config.get("reftable.blockSize") {
+            if let Ok(v) = value.parse::<u32>() {
+                opts.block_size = v;
+            }
+        }
+        if let Some(value) = config.get("reftable.restartInterval") {
+            if let Ok(v) = value.parse::<usize>() {
+                opts.restart_interval = v;
+            }
+        }
+        if let Some(value) = config.get("core.logAllRefUpdates") {
+            let value = value.to_lowercase();
+            if !(value == "true" || value == "always") {
+                opts.write_log = false;
+            }
+        }
+        return opts;
+    }
+
+    let config_path = git_dir.join("config");
     if let Ok(content) = fs::read_to_string(&config_path) {
         let mut in_reftable = false;
         let mut in_core = false;

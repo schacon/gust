@@ -6093,12 +6093,12 @@ fn resolve_previous_branch(repo: &Repository) -> Result<String> {
 
 /// Resolve the Nth previously checked out branch from the HEAD reflog.
 fn resolve_nth_previous_branch(repo: &Repository, n: usize) -> Result<String> {
-    let reflog_path = repo.git_dir.join("logs/HEAD");
-    let content = std::fs::read_to_string(&reflog_path).context("cannot read HEAD reflog")?;
+    let entries = grit_lib::reflog::read_reflog(&repo.git_dir, "HEAD")
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("cannot read HEAD reflog")?;
     let mut seen = Vec::new();
-    for line in content.lines().rev() {
-        if let Some(msg_start) = line.find("checkout: moving from ") {
-            let rest = &line[msg_start + "checkout: moving from ".len()..];
+    for entry in entries.iter().rev() {
+        if let Some(rest) = entry.message.strip_prefix("checkout: moving from ") {
             if let Some(to_idx) = rest.find(" to ") {
                 let from = &rest[..to_idx];
                 // Only add if not already the most recently seen

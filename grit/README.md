@@ -1,4 +1,4 @@
-# grit-rs
+# grit-cli
 
 A from-scratch reimplementation of the `git` command-line tool in Rust, built
 on top of [`grit-lib`](https://crates.io/crates/grit-lib).
@@ -21,7 +21,7 @@ rates.
 ## Install
 
 ```sh
-cargo install grit-rs
+cargo install grit-cli
 ```
 
 This puts a `grit` binary on your `$PATH`.

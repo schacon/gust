@@ -296,6 +296,10 @@ fn optimize_refs(_repo: &Repository) -> Result<()> {
         prune: false,
         no_prune: false,
         auto: false,
+        include: Vec::new(),
+        no_include: false,
+        exclude: Vec::new(),
+        no_exclude: false,
     })
 }
 

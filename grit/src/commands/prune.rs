@@ -151,7 +151,7 @@ fn parse_expire_time(expire: Option<&str>) -> Result<ExpirePolicy> {
                     .unwrap_or(SystemTime::UNIX_EPOCH),
             ))
         }
-        Some("now") => Ok(ExpirePolicy::All),
+        Some("now") | Some("all") => Ok(ExpirePolicy::All),
         Some(s) if s.eq_ignore_ascii_case("never") => Ok(ExpirePolicy::Never),
         Some(s) => {
             if let Some(threshold) = parse_relative_time(s) {

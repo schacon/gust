@@ -171,7 +171,14 @@ pub fn resolve_head(git_dir: &Path) -> Result<HeadState> {
     let trimmed = content.trim();
 
     if let Some(refname) = trimmed.strip_prefix("ref: ") {
-        let refname = refname.to_owned();
+        let refname = if refname == "refs/heads/.invalid" {
+            match crate::refs::read_ref_file(&git_dir.join("refs").join("heads")) {
+                Ok(crate::refs::Ref::Symbolic(target)) => target,
+                _ => refname.to_owned(),
+            }
+        } else {
+            refname.to_owned()
+        };
         let short_name = refname
             .strip_prefix("refs/heads/")
             .unwrap_or(&refname)

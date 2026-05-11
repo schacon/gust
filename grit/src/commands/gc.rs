@@ -106,7 +106,7 @@ pub fn run(args: Args) -> Result<()> {
     let quiet_effective = quiet || args.auto;
 
     if args.auto {
-        if !need_to_gc(&repo, &cfg) {
+        if !need_to_gc(&repo, &cfg) && !reftable_auto_pack_needed(&repo) {
             return Ok(());
         }
         let hook_ok = matches!(
@@ -140,7 +140,11 @@ pub fn run(args: Args) -> Result<()> {
             all: true,
             prune: true,
             no_prune: false,
-            auto: false,
+            auto: args.auto,
+            include: Vec::new(),
+            no_include: false,
+            exclude: Vec::new(),
+            no_exclude: false,
         })?;
     }
 
@@ -179,6 +183,15 @@ pub fn run(args: Args) -> Result<()> {
     run_commit_graph_for_gc(&repo, &cfg, quiet_effective, args.no_quiet)?;
 
     Ok(())
+}
+
+fn reftable_auto_pack_needed(repo: &Repository) -> bool {
+    if !grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
+        return false;
+    }
+    grit_lib::reftable::ReftableStack::open(&repo.git_dir)
+        .map(|stack| stack.table_names().len() > 2)
+        .unwrap_or(false)
 }
 
 /// Expire argument for `git prune` during `gc`: `None` means skip pruning (Git `never`).

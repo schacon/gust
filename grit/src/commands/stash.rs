@@ -3983,6 +3983,11 @@ fn do_drop(stash_ref: Option<String>, quiet: bool) -> Result<()> {
 
 fn do_clear() -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
+    if grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
+        let _ = grit_lib::reftable::reftable_delete_ref(&repo.git_dir, "refs/stash");
+        let _ = grit_lib::reftable::reftable_delete_reflog(&repo.git_dir, "refs/stash");
+        return Ok(());
+    }
     let stash_path = repo.git_dir.join("refs").join("stash");
     let log_path = reflog_path(&repo.git_dir, "refs/stash");
     let _ = fs::remove_file(&stash_path);

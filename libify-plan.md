@@ -15,7 +15,7 @@ Move reusable Git behavior from `grit/src` into `grit-lib/src` while keeping the
 - [x] Move Git binary base85 codec from `grit/src/git_binary_base85.rs` to `grit-lib/src/git_binary_base85.rs`.
 - [x] Replace CLI callers of `crate::git_binary_base85` with `grit_lib::git_binary_base85`.
 - [x] Convert moved leaf helpers away from `anyhow` and unit errors where they become public library APIs.
-- [x] Run `cargo fmt` and `cargo check -p grit-rs` after each leaf batch.
+- [x] Run `cargo fmt` and `cargo check -p grit-cli` after each leaf batch.
 
 ## Wire And Protocol Framing
 
@@ -64,6 +64,6 @@ Move reusable Git behavior from `grit/src` into `grit-lib/src` while keeping the
 ## Verification
 
 - [x] After each migration batch, run `cargo fmt`.
-- [x] After each migration batch, run `cargo check -p grit-rs`.
+- [x] After each migration batch, run `cargo check -p grit-cli`.
 - [x] For behavior-sensitive moves, run the smallest relevant upstream harness file through `./scripts/run-tests.sh`.
 - [x] Use `ReadLints` on edited files and fix newly introduced diagnostics.

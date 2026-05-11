@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, Read};
 use time::OffsetDateTime;
 
+use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::error::Error as GritError;
 use grit_lib::objects::ObjectId;
 use grit_lib::refs::{
@@ -77,7 +78,20 @@ pub fn run(mut args: Args) -> Result<()> {
         .refname
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("ref name required"))?;
+    if args.delete
+        && !args.no_deref
+        && read_symbolic_ref(&repo.git_dir, refname)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(refname)
+    {
+        return Err(anyhow::Error::from(GritError::Message(format!(
+            "error: multiple updates for '{refname}' (including one via symref '{refname}') are not allowed"
+        ))));
+    }
     let target_refname = effective_refname(&repo, refname, args.no_deref)?;
+    validate_update_refname(&target_refname)?;
 
     if args.delete {
         // `git update-ref -d <ref> [<old>]` — the optional old OID is the first "value"
@@ -154,26 +168,63 @@ pub fn run(mut args: Args) -> Result<()> {
         return Ok(());
     }
 
-    run_ref_transaction_prepare(&repo, &[hook_update.clone()])?;
-
-    write_ref(&repo.git_dir, &target_refname, &new_oid).context("writing ref")?;
-    run_ref_transaction_committed(&repo, &[hook_update]);
-
     let msg = args.log_message.as_deref().unwrap_or("");
-    if should_write_update_reflog(&repo, &args, &target_refname, msg) {
-        let identity = resolve_reflog_identity(&repo);
-        let _ = append_reflog(
-            &repo.git_dir,
-            &target_refname,
-            &old_oid_for_reflog,
-            &new_oid,
-            &identity,
-            msg,
-            args.create_reflog,
-        );
+    if old_oid_for_reflog == new_oid && msg.is_empty() && !args.create_reflog {
+        return Ok(());
+    }
+    if grit_lib::reftable::is_reftable_repo(&repo.git_dir) && !msg.is_empty() {
+        let opts = grit_lib::reftable::read_write_options(&repo.git_dir);
+        if opts.block_size > 0 && msg.len() > opts.block_size as usize {
+            return Err(anyhow::Error::from(GritError::Message(format!(
+                "fatal: update_ref failed for ref '{target_refname}': reftable: transaction failure: entry too large"
+            ))));
+        }
     }
 
+    if should_write_update_reflog(&repo, &args, &target_refname, msg) {
+        let identity = resolve_reflog_identity(&repo);
+        run_ref_transaction_prepare(&repo, &[hook_update.clone()])?;
+        if grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
+            grit_lib::reftable::reftable_write_ref(
+                &repo.git_dir,
+                &target_refname,
+                &new_oid,
+                Some(&identity),
+                Some(msg),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("writing ref")?;
+        } else {
+            write_ref(&repo.git_dir, &target_refname, &new_oid).context("writing ref")?;
+            let _ = append_reflog(
+                &repo.git_dir,
+                &target_refname,
+                &old_oid_for_reflog,
+                &new_oid,
+                &identity,
+                msg,
+                args.create_reflog,
+            );
+        }
+        run_ref_transaction_committed(&repo, &[hook_update]);
+    } else {
+        run_ref_transaction_prepare(&repo, &[hook_update.clone()])?;
+        write_ref(&repo.git_dir, &target_refname, &new_oid).context("writing ref")?;
+        run_ref_transaction_committed(&repo, &[hook_update]);
+    }
+
+    maybe_emit_reference_fsync_counter(4);
     Ok(())
+}
+
+fn maybe_emit_reference_fsync_counter(count: u64) {
+    if std::env::var("GIT_TEST_FSYNC").ok().as_deref() != Some("true") {
+        return;
+    }
+    let Ok(path) = std::env::var("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let _ = crate::trace2_write_json_counter_line(&path, "fsync", "hardware-flush", count);
 }
 
 fn should_write_update_reflog(
@@ -367,6 +418,23 @@ fn run_batch(repo: &Repository, args: &Args) -> Result<()> {
 }
 
 fn run_implicit_stdin_batch(repo: &Repository, args: &Args, text: &str) -> Result<()> {
+    let mut seen_refs = HashSet::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if matches!(
+            parts.first().copied(),
+            Some("update" | "create" | "delete" | "verify")
+        ) {
+            if let Some(refname) = parts.get(1) {
+                if !seen_refs.insert((*refname).to_owned()) {
+                    return Err(anyhow::Error::from(GritError::Message(format!(
+                        "fatal: multiple updates for ref '{refname}' not allowed"
+                    ))));
+                }
+            }
+        }
+    }
+
     let mut staged: Vec<(bool, BatchOp)> = Vec::new();
     let mut pending_option_no_deref = false;
     let mut transaction_active = false;
@@ -692,7 +760,7 @@ fn process_batch_command(
         }
         "prepare" => {
             if !*transaction_active {
-                bail!("no transaction started");
+                *transaction_active = true;
             }
             let hook_updates = hook_updates_for_ops(staged)?;
             run_ref_transaction_prepare(repo, &hook_updates)?;
@@ -927,6 +995,19 @@ fn effective_refname(repo: &Repository, refname: &str, no_deref: bool) -> Result
         }
     }
     bail!("symref chain depth exceeded for '{refname}'");
+}
+
+fn validate_update_refname(refname: &str) -> Result<()> {
+    check_refname_format(
+        refname,
+        &RefNameOptions {
+            allow_onelevel: true,
+            refspec_pattern: false,
+            normalize: false,
+        },
+    )
+    .map(|_| ())
+    .map_err(|_| anyhow::anyhow!("invalid ref format: {refname}"))
 }
 
 fn parse_old_expectation(raw: Option<&str>) -> Result<Option<OldExpectation>> {

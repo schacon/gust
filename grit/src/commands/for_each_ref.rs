@@ -135,6 +135,7 @@ struct RefEntry {
     name: String,
     oid: Option<ObjectId>,
     object_name: String,
+    symref_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +484,7 @@ fn append_root_and_pseudorefs(git_dir: &Path, refs: &mut Vec<RefEntry>) -> Resul
                     name: "HEAD".to_owned(),
                     oid: Some(oid),
                     object_name: oid.to_string(),
+                    symref_target: None,
                 },
             );
         }
@@ -496,6 +498,7 @@ fn append_root_and_pseudorefs(git_dir: &Path, refs: &mut Vec<RefEntry>) -> Resul
                 name: "HEAD".to_owned(),
                 oid: Some(oid),
                 object_name: oid.to_string(),
+                symref_target: None,
             },
         );
     }
@@ -527,6 +530,7 @@ fn append_root_and_pseudorefs(git_dir: &Path, refs: &mut Vec<RefEntry>) -> Resul
                     name: name.clone(),
                     oid: Some(oid),
                     object_name: oid.to_string(),
+                    symref_target: None,
                 },
             );
         }
@@ -537,16 +541,34 @@ fn append_root_and_pseudorefs(git_dir: &Path, refs: &mut Vec<RefEntry>) -> Resul
 fn collect_refs(git_dir: &Path) -> Result<Vec<RefEntry>> {
     // Dispatch to reftable backend if configured
     if grit_lib::reftable::is_reftable_repo(git_dir) {
-        let refs = grit_lib::reftable::reftable_list_refs(git_dir, "refs/")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        return Ok(refs
-            .into_iter()
-            .map(|(name, oid)| RefEntry {
-                name,
-                oid: Some(oid),
-                object_name: oid.to_string(),
-            })
-            .collect());
+        let stack =
+            grit_lib::reftable::ReftableStack::open(git_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut refs = Vec::new();
+        for record in stack.read_refs().map_err(|e| anyhow::anyhow!("{e}"))? {
+            if !record.name.starts_with("refs/") {
+                continue;
+            }
+            match record.value {
+                grit_lib::reftable::RefValue::Val1(oid)
+                | grit_lib::reftable::RefValue::Val2(oid, _) => refs.push(RefEntry {
+                    name: record.name,
+                    oid: Some(oid),
+                    object_name: oid.to_string(),
+                    symref_target: None,
+                }),
+                grit_lib::reftable::RefValue::Symref(target) => {
+                    let oid = resolve_ref(git_dir, &target).ok();
+                    refs.push(RefEntry {
+                        name: record.name,
+                        oid,
+                        object_name: oid.map(|oid| oid.to_string()).unwrap_or_default(),
+                        symref_target: Some(target),
+                    });
+                }
+                grit_lib::reftable::RefValue::Deletion => {}
+            }
+        }
+        return Ok(refs);
     }
 
     let mut refs: BTreeMap<String, RefEntry> = BTreeMap::new();
@@ -556,6 +578,7 @@ fn collect_refs(git_dir: &Path) -> Result<Vec<RefEntry>> {
             name,
             oid: Some(oid),
             object_name: oid.to_string(),
+            symref_target: None,
         });
     }
     Ok(refs.into_values().collect())
@@ -589,6 +612,7 @@ fn collect_loose_refs(
                             name: next_relative,
                             oid,
                             object_name,
+                            symref_target: None,
                         },
                     );
                 }
@@ -639,27 +663,31 @@ fn read_loose_ref_oid(
 
 fn parse_packed_refs(git_dir: &Path) -> Result<Vec<(String, ObjectId)>> {
     let path = git_dir.join("packed-refs");
-    let text = match fs::read_to_string(path) {
+    let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
     };
+    if !text.is_empty() && !text.ends_with('\n') {
+        let line = text.lines().last().unwrap_or("");
+        bail!("fatal: unterminated line in .git/packed-refs: {line}");
+    }
 
     let mut entries = Vec::new();
     for line in text.lines() {
         if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let Some(oid_str) = parts.next() else {
-            continue;
+        let Some((oid_str, name)) = line.split_once(' ') else {
+            bail!("fatal: unexpected line in .git/packed-refs: {line}");
         };
-        let Some(name) = parts.next() else {
-            continue;
-        };
-        if let Ok(oid) = oid_str.parse::<ObjectId>() {
-            entries.push((name.to_owned(), oid));
+        if oid_str.len() != 40 || name.trim().is_empty() || name.contains(char::is_whitespace) {
+            bail!("fatal: unexpected line in .git/packed-refs: {line}");
         }
+        let oid = oid_str
+            .parse::<ObjectId>()
+            .with_context(|| format!("fatal: unexpected line in .git/packed-refs: {line}"))?;
+        entries.push((name.trim().to_owned(), oid));
     }
     Ok(entries)
 }
@@ -1132,6 +1160,7 @@ fn atom_value(
             }
             Ok(" ".to_owned())
         }
+        "symref" => Ok(entry.symref_target.clone().unwrap_or_default()),
         "tree" => {
             let Some(oid) = entry.oid else {
                 return Err(FormatError::MissingObject(
@@ -1580,7 +1609,7 @@ fn deref_atom_value(
         .map_err(|_| FormatError::Fatal(format!("could not read tagged object '{target_oid}'")))?;
     if target_obj.kind != expected_kind {
         return Err(FormatError::Fatal(format!(
-            "object '{target_oid}' tagged as '{expected_kind}', but is a '{}' type",
+            "bad tag pointer: object '{target_oid}' tagged as '{expected_kind}', but is a '{}' type",
             target_obj.kind
         )));
     }
@@ -1590,6 +1619,7 @@ fn deref_atom_value(
         name: entry.name.clone(),
         oid: Some(target_oid),
         object_name: target_oid.to_string(),
+        symref_target: None,
     };
     // Evaluate the atom against the dereferenced entry
     atom_value(repo, &deref_entry, atom, head_branch, mailmap)

@@ -659,7 +659,12 @@ pub fn run(mut args: Args) -> Result<()> {
             bail!("Remote branch {branch} not found in upstream {remote_name}");
         }
     }
-    let ref_storage = resolved_clone_ref_storage(&args)?;
+    let ref_storage =
+        if args.ref_format.is_none() && grit_lib::reftable::is_reftable_repo(&source.git_dir) {
+            "reftable"
+        } else {
+            resolved_clone_ref_storage(&args)?
+        };
 
     // Determine target directory
     let target_name = if let Some(ref d) = args.directory {

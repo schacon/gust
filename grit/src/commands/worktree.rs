@@ -326,6 +326,33 @@ fn dwim_infer_orphan(
 // worktree add
 // ---------------------------------------------------------------------------
 
+fn initialize_worktree_reftable_stack(
+    wt_admin: &Path,
+    commit_oid: Option<ObjectId>,
+    branch_name: Option<&str>,
+) -> Result<()> {
+    let reftable_dir = wt_admin.join("reftable");
+    fs::create_dir_all(&reftable_dir)
+        .with_context(|| format!("cannot create '{}'", reftable_dir.display()))?;
+    fs::write(reftable_dir.join("tables.list"), "")?;
+
+    if let Some(oid) = commit_oid {
+        refs::write_ref(wt_admin, "refs/worktree/HEAD", &oid)?;
+    }
+    if let Some(branch_name) = branch_name {
+        grit_lib::reftable::reftable_write_symref(
+            wt_admin,
+            "refs/worktree/refs/heads",
+            &format!("refs/heads/{branch_name}"),
+            None,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    Ok(())
+}
+
 fn cmd_add(args: AddArgs) -> Result<()> {
     // Validate mutually exclusive options
     {
@@ -737,6 +764,9 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             wt_path_abs.display()
         ),
     )?;
+    if grit_lib::reftable::is_reftable_repo(&common) {
+        initialize_worktree_reftable_stack(&wt_admin, commit_oid, branch_name.as_deref())?;
+    }
 
     // Write HEAD — either branch or detached
     let detach_head = args.detach || implicit_detach;
@@ -756,19 +786,31 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         let branch_ref = format!("refs/heads/{}", branch_name);
         let ref_path = common.join(&branch_ref);
         if !ref_path.exists() {
-            // New branch: create it pointing to the commit
-            if let Some(parent) = ref_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&ref_path, format!("{}\n", commit_oid.to_hex()))?;
+            refs::write_ref(&common, &branch_ref, &commit_oid)?;
         } else if !args.force {
             // Branch already exists — check if it's checked out in another worktree
             // (For simplicity, allow it; git also warns but --force overrides)
         }
-        fs::write(
-            wt_admin.join("HEAD"),
-            format!("ref: refs/heads/{}\n", branch_name),
-        )?;
+        if grit_lib::reftable::is_reftable_repo(&common) {
+            fs::write(wt_admin.join("HEAD"), "ref: refs/heads/.invalid\n")?;
+            fs::write(
+                wt_admin.join("refs").join("heads"),
+                format!("ref: refs/heads/{}\n", branch_name),
+            )?;
+            grit_lib::reftable::reftable_write_symref(
+                &wt_admin,
+                "refs/worktree/refs/heads",
+                &format!("refs/heads/{branch_name}"),
+                None,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        } else {
+            fs::write(
+                wt_admin.join("HEAD"),
+                format!("ref: refs/heads/{}\n", branch_name),
+            )?;
+        }
     }
 
     // Write the .git file in the worktree (gitfile pointing to admin dir)
