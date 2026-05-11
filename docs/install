@@ -1,6 +1,6 @@
 #!/bin/sh
 # grit installer - downloads a pre-built binary from GitHub Releases
-# Usage: curl -fsSL https://grit-lib.com/install | sh
+# Usage: curl -fsSL https://grit-scm.com/install | sh
 
 main() {
   set -eu

@@ -52,9 +52,9 @@ mod trace2_transfer;
 mod trace_packet;
 mod wire_trace;
 
-/// Return the version string, e.g. `"2.47.0.grit"`.
+/// Return the version string, e.g. `"2.47.0.grit-0.1.3"`.
 pub fn version_string() -> String {
-    "2.47.0.grit".to_owned()
+    format!("2.47.0.grit-{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {
