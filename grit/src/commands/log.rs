@@ -215,7 +215,7 @@ pub struct Args {
     pub walk_reflogs: bool,
 
     /// Show unified diff (patch) after each commit.
-    #[arg(short = 'p', long = "patch", alias = "unified")]
+    #[arg(short = 'p', long = "patch")]
     pub patch: bool,
 
     /// Do not show diff after commits.

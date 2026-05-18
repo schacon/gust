@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 
 use crate::config::ConfigSet;
 use crate::error::{Error, Result};
-use crate::objects::ObjectId;
-use crate::refs;
 use crate::repo::{common_git_dir_for_config, Repository};
 use crate::state::{resolve_head, HeadState};
 
@@ -40,31 +38,8 @@ pub fn common_git_dir(git_dir: &Path) -> PathBuf {
 
 /// Resolve HEAD for a linked worktree admin dir (`HEAD` local, branch refs in `common`).
 #[must_use]
-pub fn resolve_linked_head(admin: &Path, common: &Path) -> HeadState {
-    let head_path = admin.join("HEAD");
-    let content = match fs::read_to_string(&head_path) {
-        Ok(c) => c,
-        Err(_) => return HeadState::Invalid,
-    };
-    let trimmed = content.trim();
-    if let Some(refname) = trimmed.strip_prefix("ref: ") {
-        let refname = refname.to_owned();
-        let short_name = refname
-            .strip_prefix("refs/heads/")
-            .unwrap_or(&refname)
-            .to_owned();
-        let oid = refs::resolve_ref(common, &refname).ok();
-        HeadState::Branch {
-            refname,
-            short_name,
-            oid,
-        }
-    } else {
-        match ObjectId::from_hex(trimmed) {
-            Ok(oid) => HeadState::Detached { oid },
-            Err(_) => HeadState::Invalid,
-        }
-    }
+pub fn resolve_linked_head(admin: &Path, _common: &Path) -> HeadState {
+    resolve_head(admin).unwrap_or(HeadState::Invalid)
 }
 
 /// Whether `common` is configured as a bare repository (`core.bare=true`).
