@@ -1821,7 +1821,7 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
     }
 
     let current = head.branch_name().unwrap_or("");
-    if name == current {
+    if name == current && repo.work_tree.is_some() {
         let wt_path = repo
             .work_tree
             .as_deref()

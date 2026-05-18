@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
+use grit_lib::config::ConfigSet;
 use grit_lib::index::{Index, IndexEntry};
 use grit_lib::objects::ObjectId;
 use grit_lib::refs;
@@ -253,6 +254,69 @@ fn resolve_commitish(repo: &Repository, spec: &str) -> Result<ObjectId> {
     bail!("not a valid commit-ish: '{spec}'");
 }
 
+/// `remote/branch` start ref (not a full `refs/remotes/...` ref).
+fn parse_explicit_remote_branch(spec: &str) -> Option<(&str, &str)> {
+    if spec.starts_with("refs/") {
+        return None;
+    }
+    let slash = spec.find('/')?;
+    let remote = spec.get(..slash)?.trim();
+    let branch = spec.get(slash + 1..)?.trim();
+    if remote.is_empty() || branch.is_empty() {
+        return None;
+    }
+    Some((remote, branch))
+}
+
+fn write_branch_tracking_config(common: &Path, branch: &str, remote: &str, merge_branch: &str) {
+    let cfg_path = common.join("config");
+    if let Ok(mut cfg_content) = std::fs::read_to_string(&cfg_path) {
+        let section = format!(
+            "\n[branch \"{branch}\"]\
+\n\tremote = {remote}\
+\n\tmerge = refs/heads/{merge_branch}\n"
+        );
+        cfg_content.push_str(&section);
+        let _ = fs::write(&cfg_path, cfg_content);
+    }
+}
+
+/// Resolve `branch` against remote-tracking refs; honor `checkout.defaultRemote` when ambiguous.
+fn resolve_remote_branch_dwim(
+    common: &Path,
+    branch: &str,
+    default_remote: Option<&str>,
+) -> Result<Option<(ObjectId, String)>> {
+    let remote_refs = refs::list_refs(common, "refs/remotes/").unwrap_or_default();
+    let mut matching: Vec<(String, ObjectId)> = remote_refs
+        .iter()
+        .filter_map(|(r, oid)| {
+            let rest = r.strip_prefix("refs/remotes/")?;
+            let (remote, name) = rest.split_once('/')?;
+            if name == branch {
+                Some((remote.to_string(), *oid))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    if matching.len() > 1 {
+        if let Some(def) = default_remote {
+            matching.retain(|(remote, _)| remote == def);
+        }
+        if matching.len() != 1 {
+            bail!(
+                "fatal: '{branch}' matched multiple (remote) tracking branches"
+            );
+        }
+    }
+    let (remote, oid) = matching.swap_remove(0);
+    Ok(Some((oid, remote)))
+}
+
 /// True when any ref exists under `refs/heads/` (Git: `refs_for_each_branch_ref`).
 fn has_any_local_branch(common: &Path) -> bool {
     refs::list_refs(common, "refs/heads/")
@@ -270,8 +334,8 @@ fn can_use_local_refs(common: &Path, head_state: &grit_lib::state::HeadState) ->
 }
 
 /// Git's `can_use_remote_refs`: when `guess_remote` is on, remote-tracking refs count as a source.
-fn can_use_remote_refs(common: &Path, args: &AddArgs) -> Result<bool> {
-    if !args.guess_remote || args.no_guess_remote {
+fn can_use_remote_refs(common: &Path, guess_remote: bool, no_guess_remote: bool) -> Result<bool> {
+    if !guess_remote || no_guess_remote {
         return Ok(false);
     }
     Ok(!refs::list_refs(common, "refs/remotes/")
@@ -287,13 +351,14 @@ fn dwim_infer_orphan(
     common: &Path,
     head_state: &grit_lib::state::HeadState,
     args: &AddArgs,
+    guess_remote: bool,
     check_remote: bool,
 ) -> Result<bool> {
     if can_use_local_refs(common, head_state) {
         return Ok(false);
     }
 
-    if check_remote && can_use_remote_refs(common, args)? {
+    if check_remote && can_use_remote_refs(common, guess_remote, args.no_guess_remote)? {
         return Ok(false);
     }
 
@@ -384,6 +449,17 @@ fn cmd_add(args: AddArgs) -> Result<()> {
 
     let repo = Repository::discover(None)?;
     let common = common_dir(&repo.git_dir)?;
+    let config = ConfigSet::load(Some(&common), true).unwrap_or_default();
+    let default_remote = config.get("checkout.defaultRemote");
+    let mut guess_remote = args.guess_remote;
+    if !args.no_guess_remote && !guess_remote {
+        if config
+            .get("worktree.guessRemote")
+            .is_some_and(|v| v == "true")
+        {
+            guess_remote = true;
+        }
+    }
 
     // Determine the absolute path for the new worktree
     let wt_path = if args.path.is_absolute() {
@@ -426,9 +502,9 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     let used_new_branch_options = args.new_branch.is_some() || args.force_new_branch.is_some();
     if !orphan {
         if args.branch.is_none() && used_new_branch_options {
-            orphan = dwim_infer_orphan(&common, &head_state, &args, false)?;
+            orphan = dwim_infer_orphan(&common, &head_state, &args, guess_remote, false)?;
         } else if args.branch.is_none() && !used_new_branch_options {
-            orphan = dwim_infer_orphan(&common, &head_state, &args, true)?;
+            orphan = dwim_infer_orphan(&common, &head_state, &args, guess_remote, true)?;
         }
     }
 
@@ -536,54 +612,36 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             let oid =
                 head_oid.ok_or_else(|| anyhow::anyhow!("fatal: invalid reference: '{spec}'"))?;
             (Some(spec.clone()), Some(oid), false)
+        } else if let Some((remote, branch_on_remote)) = parse_explicit_remote_branch(spec) {
+            let tracking = format!("refs/remotes/{remote}/{branch_on_remote}");
+            let oid = refs::resolve_ref(&common, &tracking).map_err(|_| {
+                anyhow::anyhow!("fatal: invalid reference: '{spec}'")
+            })?;
+            if !args.no_track {
+                write_branch_tracking_config(
+                    &common,
+                    branch_on_remote,
+                    remote,
+                    branch_on_remote,
+                );
+            }
+            (
+                Some(branch_on_remote.to_string()),
+                Some(oid),
+                false,
+            )
+        } else if let Some((oid, remote_name)) =
+            resolve_remote_branch_dwim(&common, spec, default_remote.as_deref())?
+        {
+            if !args.no_track {
+                write_branch_tracking_config(&common, spec, &remote_name, spec);
+            }
+            (Some(spec.clone()), Some(oid), false)
         } else {
             // Existing non-branch commit-ish (e.g. tag): check out detached.
             match resolve_commitish(&repo, spec) {
                 Ok(oid) => (None, Some(oid), true),
-                Err(_) => {
-                    // Unknown name: fail unless DWIM via remote is available
-                    // Try DWIM from remote tracking refs
-                    let remote_refs =
-                        grit_lib::refs::list_refs(&common, "refs/remotes/").unwrap_or_default();
-                    let matching: Vec<_> = remote_refs
-                        .iter()
-                        .filter(|(r, _)| {
-                            let parts: Vec<&str> = r
-                                .trim_start_matches("refs/remotes/")
-                                .splitn(2, '/')
-                                .collect();
-                            parts.len() == 2 && parts[1] == spec
-                        })
-                        .collect();
-                    if matching.len() == 1 {
-                        // DWIM: create tracking branch from remote
-                        let oid = matching[0].1;
-                        // Get remote name for tracking setup
-                        let remote_name = matching[0]
-                            .0
-                            .trim_start_matches("refs/remotes/")
-                            .split('/')
-                            .next()
-                            .unwrap_or("origin")
-                            .to_owned();
-                        if !args.no_track {
-                            let cfg_path = common.join("config");
-                            if let Ok(mut cfg_content) = std::fs::read_to_string(&cfg_path) {
-                                let section = format!(
-                                    "\n[branch \"{}\"]\
-\n\tremote = {}\
-\n\tmerge = refs/heads/{}\n",
-                                    spec, remote_name, spec
-                                );
-                                cfg_content.push_str(&section);
-                                let _ = std::fs::write(&cfg_path, cfg_content);
-                            }
-                        }
-                        (Some(spec.clone()), Some(oid), false)
-                    } else {
-                        bail!("fatal: invalid reference: '{}'", spec);
-                    }
-                }
+                Err(_) => bail!("fatal: invalid reference: '{spec}'"),
             }
         }
     } else {
@@ -591,42 +649,15 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         // like the path basename, else `new_branch` = basename and start from HEAD / remote.
         if let Ok(oid) = refs::resolve_ref(&common, &format!("refs/heads/{wt_name}")) {
             (Some(wt_name.clone()), Some(oid), false)
-        } else if let Some(oid) = head_oid {
-            (Some(wt_name.clone()), Some(oid), false)
-        } else if args.guess_remote && !args.no_guess_remote {
-            let remote_refs = refs::list_refs(&common, "refs/remotes/").unwrap_or_default();
-            let matching: Vec<_> = remote_refs
-                .iter()
-                .filter(|(r, _)| {
-                    let parts: Vec<&str> = r
-                        .trim_start_matches("refs/remotes/")
-                        .splitn(2, '/')
-                        .collect();
-                    parts.len() == 2 && parts[1] == wt_name.as_str()
-                })
-                .collect();
-            if matching.len() == 1 {
-                let oid = matching[0].1;
-                let remote_name = matching[0]
-                    .0
-                    .trim_start_matches("refs/remotes/")
-                    .split('/')
-                    .next()
-                    .unwrap_or("origin")
-                    .to_owned();
+        } else if guess_remote && !args.no_guess_remote {
+            if let Some((oid, remote_name)) =
+                resolve_remote_branch_dwim(&common, &wt_name, default_remote.as_deref())?
+            {
                 if !args.no_track {
-                    let cfg_path = common.join("config");
-                    if let Ok(mut cfg_content) = std::fs::read_to_string(&cfg_path) {
-                        let section = format!(
-                            "\n[branch \"{}\"]\
-\n\tremote = {}\
-\n\tmerge = refs/heads/{}\n",
-                            wt_name, remote_name, wt_name
-                        );
-                        cfg_content.push_str(&section);
-                        let _ = std::fs::write(&cfg_path, cfg_content);
-                    }
+                    write_branch_tracking_config(&common, &wt_name, &remote_name, &wt_name);
                 }
+                (Some(wt_name.clone()), Some(oid), false)
+            } else if let Some(oid) = head_oid {
                 (Some(wt_name.clone()), Some(oid), false)
             } else {
                 let branch_n = wt_name.as_str();
@@ -642,6 +673,8 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                 );
                 bail!("invalid reference: HEAD");
             }
+        } else if let Some(oid) = head_oid {
+            (Some(wt_name.clone()), Some(oid), false)
         } else {
             let branch_n = wt_name.as_str();
             eprintln!("hint: If you meant to create a worktree containing a new unborn branch");

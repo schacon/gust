@@ -1797,9 +1797,10 @@ impl ConfigSet {
             }
         }
 
-        // Local config
+        // Local config — linked worktrees read `commondir/config`, not the admin `config`.
         if let Some(gd) = git_dir {
-            let local_path = gd.join("config");
+            let common_dir = crate::repo::common_git_dir_for_config(gd);
+            let local_path = common_dir.join("config");
             match ConfigFile::from_path(&local_path, ConfigScope::Local) {
                 Ok(Some(f)) => Self::merge_with_includes(&mut set, &f, proc, 0, &ctx)?,
                 Ok(None) => {}
@@ -1808,7 +1809,6 @@ impl ConfigSet {
 
             // Worktree config — Git only reads `config.worktree` when
             // `extensions.worktreeConfig` is enabled in the common repository `config`.
-            let common_dir = crate::repo::common_git_dir_for_config(gd);
             let wt_path = gd.join("config.worktree");
             if crate::repo::worktree_config_enabled(&common_dir) {
                 match ConfigFile::from_path(&wt_path, ConfigScope::Worktree) {
