@@ -103,11 +103,11 @@ tests. Most logic belongs in a new **`grit-lib/src/worktree.rs`** (and friends).
 
 ### 1.4 Harness targets (worktrees)
 
-- [~] `t2400-worktree-add` (tests 1–23 green; grafts and later cases remain)
+- [x] `t2400-worktree-add`
 - [x] `t2402-worktree-list`
-- [ ] `t2401-worktree-prune`, `t2406-worktree-repair`
-- [ ] `t2404-worktree-config`, `t2407-worktree-heads`
-- [ ] `t3908-stash-in-worktree`, `t2205-add-worktree-config` (non-interactive paths)
+- [x] `t2401-worktree-prune`, `t2406-worktree-repair`
+- [x] `t2404-worktree-config`, `t2407-worktree-heads`
+- [x] `t3908-stash-in-worktree`, `t2205-add-worktree-config` (non-interactive paths)
 - [x] `t1415-worktree-refs`
 - [x] `t1407-worktree-ref-store` (plumbing)
 
