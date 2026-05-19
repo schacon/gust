@@ -1,6 +1,6 @@
 # Progress — Grit Test Coverage
 
-**Updated:** 2026-04-28
+**Updated:** 2026-05-19
 
 ## Counts (derived from plan.md)
 

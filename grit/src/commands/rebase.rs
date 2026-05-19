@@ -2325,6 +2325,62 @@ fn rebase_merge_dir(git_dir: &Path) -> std::path::PathBuf {
     git_dir.join("rebase-merge")
 }
 
+/// Whether `rebase --update-refs` is active (CLI flag or `rebase.updateRefs`).
+fn rebase_update_refs_enabled(args: &Args, config: &ConfigSet) -> bool {
+    if args.no_update_refs {
+        return false;
+    }
+    if args.update_refs {
+        return true;
+    }
+    config
+        .get_bool("rebase.updateRefs")
+        .and_then(|r| r.ok())
+        .unwrap_or(false)
+}
+
+/// Write `rebase-merge/update-refs` for branches pointing at commits being replayed.
+/// Branch refs (full name) pointing at `oid`, excluding `skip_ref` (usually HEAD).
+fn branch_refs_at_commit(
+    git_dir: &Path,
+    oid: ObjectId,
+    skip_ref: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for (refname, target) in list_refs(git_dir, "refs/heads/")? {
+        if target == oid && skip_ref != Some(refname.as_str()) {
+            out.push(refname);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn write_rebase_update_refs(git_dir: &Path, rebase_commits: &[ObjectId]) -> Result<()> {
+    let commit_set: HashSet<ObjectId> = rebase_commits.iter().copied().collect();
+    if commit_set.is_empty() {
+        return Ok(());
+    }
+    let rb_dir = rebase_merge_dir(git_dir);
+    let all_refs = list_refs(git_dir, "refs/heads/")?;
+    let zero = "0".repeat(40);
+    let mut body = String::new();
+    for (refname, oid) in all_refs {
+        if commit_set.contains(&oid) {
+            body.push_str(&refname);
+            body.push('\n');
+            body.push_str(&oid.to_hex());
+            body.push('\n');
+            body.push_str(&zero);
+            body.push('\n');
+        }
+    }
+    if !body.is_empty() {
+        fs::write(rb_dir.join("update-refs"), body)?;
+    }
+    Ok(())
+}
+
 fn rebase_todo_actionable_lines(content: &str) -> Vec<&str> {
     content
         .lines()
@@ -3015,6 +3071,7 @@ fn run_interactive_rebase(
     config: &ConfigSet,
     autostash_oid: Option<&ObjectId>,
     autosquash: bool,
+    update_refs: bool,
 ) -> Result<(Vec<String>, Vec<(ObjectId, RebaseTodoCmd)>)> {
     if autosquash {
         validate_rebase_instruction_format(config)?;
@@ -3028,10 +3085,19 @@ fn run_interactive_rebase(
             .map(|o| (o, RebaseTodoCmd::Pick))
             .collect()
     };
+    let head_ref = match resolve_head(git_dir)? {
+        HeadState::Branch { refname, .. } => Some(refname),
+        _ => None,
+    };
     let mut todo = String::new();
     for (oid, cmd) in &entries {
         todo.push_str(&format_rebase_todo_line(repo, oid, *cmd, config, true)?);
         todo.push('\n');
+        if update_refs {
+            for refname in branch_refs_at_commit(git_dir, *oid, head_ref.as_deref())? {
+                todo.push_str(&format!("update-ref {refname}\n"));
+            }
+        }
     }
     let rb_merge = rebase_merge_dir(git_dir);
     let _ = fs::remove_dir_all(&rb_merge);
@@ -3580,6 +3646,7 @@ Use '--' to separate paths from revisions, like this:\n\
         }
     }
 
+    let commits_for_update_refs = commits.clone();
     let mut generated_merge_script: Option<String> = None;
     let (rebase_todo_lines, rebase_interactive) = if rebase_merges_on {
         // Do not use `collect_rebase_todo_commits` emptiness here: it walks first-parent chains only
@@ -3645,6 +3712,7 @@ Use '--' to separate paths from revisions, like this:\n\
             &config,
             autostash_oid.as_ref(),
             want_autosquash,
+            rebase_update_refs_enabled(&args, &config),
         )?;
         if edited_lines.is_empty() {
             if pre_editor_len > 0 {
@@ -3735,6 +3803,9 @@ Use '--' to separate paths from revisions, like this:\n\
         _ => "detached HEAD".to_string(),
     };
     fs::write(rb_dir.join("head-name"), &head_name)?;
+    if rebase_update_refs_enabled(&args, &config) && matches!(backend, RebaseBackend::Merge) {
+        write_rebase_update_refs(git_dir, &commits_for_update_refs)?;
+    }
     fs::write(rb_dir.join("orig-head"), head_oid.to_hex())?;
     fs::write(
         git_dir.join("ORIG_HEAD"),
