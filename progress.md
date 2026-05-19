@@ -19,6 +19,7 @@ Task lines in `PLAN.md`: 381 completed (`[x]`), 6 in progress (`[~]`), 385 remai
 
 ## Recently completed
 
+- `t1407-worktree-ref-store` — 4/4 (`test-tool ref-store worktree:*` dispatch + `resolve_ref_storage`).
 - `t1415-worktree-refs` — 10/10 (per-worktree ref storage, `main-worktree/` / `worktrees/` prefixes, DWIM + ambiguous warnings, linked `for-each-ref`).
 - `t2205-add-worktree-config` — 13/13 (`ls-files` with `core.worktree`, own `.git` traversal, `--directory` collapse).
 - `t3908-stash-in-worktree` — 2/2 (already passing).
