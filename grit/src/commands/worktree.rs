@@ -739,10 +739,23 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             let tracking = format!("refs/remotes/{remote}/{branch_on_remote}");
             let oid = refs::resolve_ref(&common, &tracking)
                 .map_err(|_| anyhow::anyhow!("fatal: invalid reference: '{spec}'"))?;
-            if !args.no_track {
-                write_branch_tracking_config(&common, branch_on_remote, remote, branch_on_remote);
+            if let Ok(local_oid) =
+                refs::resolve_ref(&common, &format!("refs/heads/{branch_on_remote}"))
+            {
+                (Some(branch_on_remote.to_string()), Some(local_oid), false)
+            } else if can_use_local_refs(&common, &git_dir, &head_state, true) {
+                if !args.no_track {
+                    write_branch_tracking_config(
+                        &common,
+                        branch_on_remote,
+                        remote,
+                        branch_on_remote,
+                    );
+                }
+                (Some(branch_on_remote.to_string()), Some(oid), false)
+            } else {
+                (None, Some(oid), true)
             }
-            (Some(branch_on_remote.to_string()), Some(oid), false)
         } else if let Some((oid, remote_name)) =
             resolve_remote_branch_dwim(&common, spec, default_remote.as_deref())?
         {

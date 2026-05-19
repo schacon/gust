@@ -67,7 +67,10 @@ pub fn occupied_branch_refs(repo: &Repository) -> HashMap<String, String> {
     let common = common_git_dir(repo);
     let main_wt_path = main_worktree_path(repo, &common);
 
-    collect_from_admin(&common, &main_wt_path, &mut out);
+    // Bare main worktrees do not occupy branches (see `prepare_checked_out_branches` in git/branch.c).
+    if !grit_lib::worktree::is_bare_repository(&common) {
+        collect_from_admin(&common, &main_wt_path, &mut out);
+    }
 
     let worktrees_dir = common.join("worktrees");
     if let Ok(entries) = fs::read_dir(&worktrees_dir) {
