@@ -1945,7 +1945,7 @@ fn init_in_repo(repo: &Repository, args: &InitArgs, quiet: bool) -> Result<()> {
                 }
             }
 
-            let resolved_url = submodule_clone_argument(work_tree, &m.url)?;
+            let resolved_url = resolve_submodule_super_url(work_tree, &repo.git_dir, &m.url)?;
             config.set(&url_key, &resolved_url)?;
             let reg_path = submodule_display_path_from_cwd(&work_tree.join(&m.path));
             if !quiet {
