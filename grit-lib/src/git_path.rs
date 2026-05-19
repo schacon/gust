@@ -440,12 +440,12 @@ pub fn abspath_part_inside_repo(path: &str, work_tree: &Path) -> Option<String> 
         }
     }
 
-    let wt_canon = std::fs::canonicalize(work_tree).ok()?;
+    let wt_canon = path_for_disk_compare(work_tree);
     let mut cum = String::new();
     for seg in p.split('/').filter(|s| !s.is_empty()) {
         cum.push('/');
         cum.push_str(seg);
-        let rp = std::fs::canonicalize(Path::new(&cum)).ok()?;
+        let rp = path_for_disk_compare(Path::new(&cum));
         if rp == wt_canon {
             if p.len() == cum.len() {
                 return Some(String::new());
@@ -455,11 +455,30 @@ pub fn abspath_part_inside_repo(path: &str, work_tree: &Path) -> Option<String> 
             }
         }
     }
-    let full = std::fs::canonicalize(Path::new(p)).ok()?;
+    let full = path_for_disk_compare(Path::new(p));
     if full == wt_canon {
         return Some(String::new());
     }
     None
+}
+
+/// Canonicalize a path for on-disk comparison (macOS `/private` aliasing).
+///
+/// On macOS, `/tmp` and `/private/tmp` refer to the same directory; Git stores and
+/// accepts both spellings when matching paths against `core.worktree`.
+#[must_use]
+pub fn path_for_disk_compare(path: &Path) -> PathBuf {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(stripped) = canon.strip_prefix("/private") {
+            let without_private = PathBuf::from("/").join(stripped);
+            if without_private.exists() {
+                return without_private;
+            }
+        }
+    }
+    canon
 }
 
 /// Git `setup.c` `prefix_path_gently` (POSIX).

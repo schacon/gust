@@ -175,6 +175,7 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     let repo = Repository::discover(None).context("not a git repository")?;
+    let own_git_dir = grit_lib::git_path::path_for_disk_compare(&repo.git_dir);
     let cwd = repo.effective_pathspec_cwd();
     let work_tree = if let Some(wt) = repo.work_tree.as_deref() {
         wt
@@ -706,6 +707,8 @@ pub fn run(args: Args) -> Result<()> {
             } else {
                 Some(pathspec_filter.as_slice())
             },
+            &own_git_dir,
+            args.directory && !args.ignored,
         )?;
         untracked.sort();
 
@@ -1398,6 +1401,8 @@ fn walk_worktree(
     hide_empty_directories: bool,
     precompose_unicode: bool,
     pathspecs: Option<&[Pathspec]>,
+    own_git_dir: &std::path::Path,
+    opaque_own_git_dir: bool,
 ) -> Result<bool> {
     let mut rel_bytes = path_to_bytes(dir.strip_prefix(root).unwrap_or(dir));
     if precompose_unicode {
@@ -1456,7 +1461,9 @@ fn walk_worktree(
             }
         } else if ft.is_dir() {
             let dot_git = path.join(".git");
-            if dot_git_marks_git_repository(&dot_git) {
+            let is_own_git_dir =
+                dot_git_marks_git_repository(&dot_git) && dot_git_is_own_repository(&dot_git, own_git_dir);
+            if dot_git_marks_git_repository(&dot_git) && !is_own_git_dir {
                 // Untracked git repository: emit as a directory entry
                 // (git treats these as opaque and doesn't recurse into them)
                 let dir_prefix_str = format!("{}/", String::from_utf8_lossy(&rel_bytes));
@@ -1472,11 +1479,18 @@ fn walk_worktree(
                 }
                 continue;
             }
+            if is_own_git_dir && emit_empty_directories && opaque_own_git_dir {
+                let mut dir_entry = rel_bytes.clone();
+                dir_entry.push(b'/');
+                out.push(dir_entry);
+                continue;
+            }
             let prefix_slash: Vec<u8> = [rel_bytes.as_slice(), b"/"].concat();
             let has_tracked_under = indexed.iter().any(|t| t.starts_with(&prefix_slash));
             let must_recurse = !emit_empty_directories
                 || hide_empty_directories
                 || has_tracked_under
+                || is_own_git_dir
                 || pathspecs.is_some_and(|ps| pathspec_requires_recurse_into_dir(&rel_bytes, ps));
             if emit_empty_directories && !must_recurse {
                 let mut dir_entry = rel_bytes.clone();
@@ -1495,6 +1509,8 @@ fn walk_worktree(
                 hide_empty_directories,
                 precompose_unicode,
                 pathspecs,
+                own_git_dir,
+                opaque_own_git_dir,
             )? {
                 added = true;
             }
@@ -1797,13 +1813,37 @@ fn resolve_pathspec(
         cwd.join(std::path::Path::new(nfc_lossy.as_str()))
     };
     let normalized = normalize_path(&combined);
-    let rel = normalized.strip_prefix(work_tree).with_context(|| {
-        format!(
-            "pathspec '{}' is outside repository work tree",
-            pathspec.display()
+    let rel: PathBuf = if pathspec.is_absolute() {
+        let normalized_str = normalized.to_string_lossy();
+        PathBuf::from(
+            grit_lib::git_path::abspath_part_inside_repo(&normalized_str, work_tree)
+                .with_context(|| {
+                    format!(
+                        "pathspec '{}' is outside repository work tree",
+                        pathspec.display()
+                    )
+                })?,
         )
-    })?;
-    Ok(Pathspec::Literal(path_to_bytes(rel)))
+    } else {
+        normalized
+            .strip_prefix(work_tree)
+            .with_context(|| {
+                format!(
+                    "pathspec '{}' is outside repository work tree",
+                    pathspec.display()
+                )
+            })?
+            .to_path_buf()
+    };
+    Ok(Pathspec::Literal(path_to_bytes(rel.as_path())))
+}
+
+/// True when `dir/.git` resolves to this repository's git directory (not a nested repo).
+fn dot_git_is_own_repository(dot_git: &std::path::Path, own_git_dir: &std::path::Path) -> bool {
+    let Ok(resolved) = resolve_dot_git(dot_git) else {
+        return false;
+    };
+    grit_lib::git_path::path_for_disk_compare(&resolved) == own_git_dir
 }
 
 /// Path from `cwd` to `work_tree.join(repo_rel)` using `../` segments (Git `ls-files` output).
@@ -2118,31 +2158,18 @@ fn collapse_to_directories(paths: &[Vec<u8>]) -> Vec<Vec<u8>> {
             out.push(top);
             continue;
         }
-        if b.subs.is_empty() {
-            // Only `top/file` paths: always collapse to `top/` (matches Git).
-            let mut line = top;
-            line.push(b'/');
-            out.push(line);
-            continue;
-        }
-        if !b.direct.is_empty() {
+        for f in &b.direct {
             let mut line = top.clone();
             line.push(b'/');
+            line.extend_from_slice(f);
             out.push(line);
         }
         for (sub, info) in b.subs {
             let mut prefix = top.clone();
             prefix.push(b'/');
             prefix.extend_from_slice(&sub);
-            if info.files.is_empty() {
-                prefix.push(b'/');
-                out.push(prefix);
-            } else if info.files.len() == 1 {
-                prefix.push(b'/');
-                prefix.extend_from_slice(&info.files[0]);
-                out.push(prefix);
-            } else {
-                prefix.push(b'/');
+            prefix.push(b'/');
+            if info.empty_dir || !info.files.is_empty() {
                 out.push(prefix);
             }
         }
