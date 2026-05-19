@@ -108,7 +108,8 @@ tests. Most logic belongs in a new **`grit-lib/src/worktree.rs`** (and friends).
 - [ ] `t2401-worktree-prune`, `t2406-worktree-repair`
 - [ ] `t2404-worktree-config`, `t2407-worktree-heads`
 - [ ] `t3908-stash-in-worktree`, `t2205-add-worktree-config` (non-interactive paths)
-- [ ] `t1415-worktree-refs`, `t1407-worktree-ref-store` (plumbing)
+- [x] `t1415-worktree-refs`
+- [ ] `t1407-worktree-ref-store` (plumbing)
 
 ---
 
