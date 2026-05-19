@@ -42,6 +42,22 @@ pub fn resolve_linked_head(admin: &Path, _common: &Path) -> HeadState {
     resolve_head(admin).unwrap_or(HeadState::Invalid)
 }
 
+/// Number of registered worktrees (main + linked entries under `worktrees/`).
+#[must_use]
+pub fn registered_worktree_count(common: &Path) -> usize {
+    let worktrees_dir = common.join("worktrees");
+    if !worktrees_dir.is_dir() {
+        return 1;
+    }
+    let linked = fs::read_dir(&worktrees_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .count();
+    1 + linked
+}
+
 /// Whether `common` is configured as a bare repository (`core.bare=true`).
 #[must_use]
 pub fn is_bare_repository(common: &Path) -> bool {
@@ -121,9 +137,9 @@ pub fn list_worktrees(repo: &Repository) -> Result<Vec<WorktreeEntry>> {
 #[must_use]
 pub fn worktree_path_basename(path: &Path) -> String {
     let s = path.to_string_lossy();
-    let trimmed = s.trim_end_matches(|c| c == '/' || c == '\\');
+    let trimmed = s.trim_end_matches(['/', '\\']);
     trimmed
-        .rsplit(|c| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(trimmed)
         .to_owned()
@@ -236,10 +252,7 @@ pub fn copy_filtered_worktree_config(source_git_dir: &Path, admin_dir: &Path) ->
     }
     let dst = admin_dir.join("config.worktree");
     fs::copy(&src, &dst).map_err(Error::Io)?;
-    strip_worktree_config_keys(
-        &dst,
-        &["core.bare", "core.worktree"],
-    )?;
+    strip_worktree_config_keys(&dst, &["core.bare", "core.worktree"])?;
     Ok(())
 }
 

@@ -1331,6 +1331,22 @@ fn resolve_git_dir() -> Option<PathBuf> {
         .map(|r| r.git_dir)
 }
 
+/// Target file for `git config --worktree` (matches Git `builtin/config.c`).
+fn resolve_worktree_config_file(git_dir: &Path) -> Result<(ConfigScope, PathBuf)> {
+    let common = common_git_dir_for_config(git_dir);
+    if worktree_config_enabled(&common) {
+        return Ok((ConfigScope::Worktree, git_dir.join("config.worktree")));
+    }
+    if registered_worktree_count(&common) > 1 {
+        bail!(
+            "--worktree cannot be used with multiple working trees unless the config\n\
+extension worktreeConfig is enabled. Please read \"CONFIGURATION FILE\"\n\
+section in \"git help worktree\" for details"
+        );
+    }
+    Ok((ConfigScope::Local, common.join("config")))
+}
+
 /// Determine which config file to write to based on flags.
 fn resolve_config_file(args: &Args, git_dir: Option<&Path>) -> Result<(ConfigScope, PathBuf)> {
     if let Some(ref path) = args.file {
@@ -1349,11 +1365,12 @@ fn resolve_config_file(args: &Args, git_dir: Option<&Path>) -> Result<(ConfigSco
     }
     if args.worktree {
         let gd = git_dir.ok_or_else(|| anyhow::anyhow!("not in a git repository"))?;
-        return Ok((ConfigScope::Worktree, gd.join("config.worktree")));
+        return resolve_worktree_config_file(gd);
     }
     // Default: local
     if let Some(gd) = git_dir {
-        Ok((ConfigScope::Local, gd.join("config")))
+        let common = common_git_dir_for_config(gd);
+        Ok((ConfigScope::Local, common.join("config")))
     } else {
         // Outside repo, default to global for read operations
         let path = global_config_path().unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
@@ -1483,7 +1500,8 @@ fn load_config(
     if args.local {
         let mut set = ConfigSet::new();
         if let Some(gd) = git_dir {
-            if let Some(f) = ConfigFile::from_path(&gd.join("config"), ConfigScope::Local)? {
+            let common = common_git_dir_for_config(gd);
+            if let Some(f) = ConfigFile::from_path(&common.join("config"), ConfigScope::Local)? {
                 if process_includes {
                     set.merge_file_with_includes(&f, true, &load_opts.include_ctx)
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1498,8 +1516,8 @@ fn load_config(
     if args.worktree {
         let mut set = ConfigSet::new();
         if let Some(gd) = git_dir {
-            let p = gd.join("config.worktree");
-            if let Some(f) = ConfigFile::from_path(&p, ConfigScope::Worktree)? {
+            let (scope, p) = resolve_worktree_config_file(gd)?;
+            if let Some(f) = ConfigFile::from_path(&p, scope)? {
                 set.merge(&f);
             }
         }

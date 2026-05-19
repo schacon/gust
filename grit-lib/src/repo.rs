@@ -584,54 +584,12 @@ impl Repository {
     /// Whether this is a bare repository (no working tree).
     #[must_use]
     pub fn is_bare(&self) -> bool {
-        // Check core.bare first - it overrides work_tree detection
-        let config_path = self.git_dir.join("config");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            let mut in_core = false;
-            for line in content.lines() {
-                let t = line.trim();
-                if t.starts_with('[') {
-                    in_core = t.eq_ignore_ascii_case("[core]");
-                    continue;
-                }
-                if in_core {
-                    if let Some((k, v)) = t.split_once('=') {
-                        if k.trim().eq_ignore_ascii_case("bare") {
-                            if v.trim().eq_ignore_ascii_case("true") {
-                                return true;
-                            } else if v.trim().eq_ignore_ascii_case("false") {
-                                return false;
-                            }
-                        }
-                    }
-                }
+        if let Ok(cfg) = ConfigSet::load(Some(&self.git_dir), true) {
+            if let Some(Ok(bare)) = cfg.get_bool("core.bare") {
+                return bare;
             }
         }
-        if self.work_tree.is_some() {
-            return false;
-        }
-        // Check core.bare in the repo config.  A .git directory of a
-        // non-bare repo has objects/ and HEAD but core.bare=false.
-        let config_path = self.git_dir.join("config");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            let mut in_core = false;
-            for line in content.lines() {
-                let t = line.trim();
-                if t.starts_with('[') {
-                    in_core = t.eq_ignore_ascii_case("[core]");
-                    continue;
-                }
-                if in_core {
-                    if let Some((k, v)) = t.split_once('=') {
-                        if k.trim().eq_ignore_ascii_case("bare") {
-                            return v.trim().eq_ignore_ascii_case("true");
-                        }
-                    }
-                }
-            }
-        }
-        // No core.bare setting — if work_tree is None, assume bare
-        true
+        self.work_tree.is_none()
     }
 
     /// Read an object, transparently following replace refs.
