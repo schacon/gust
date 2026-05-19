@@ -19,6 +19,8 @@ Task lines in `PLAN.md`: 381 completed (`[x]`), 6 in progress (`[~]`), 385 remai
 
 ## Recently completed
 
+- `t2205-add-worktree-config` — 13/13 (`ls-files` with `core.worktree`, own `.git` traversal, `--directory` collapse).
+- `t3908-stash-in-worktree` — 2/2 (already passing).
 - `t2403-worktree-move` — 33/33 (submodule guard on move/remove; `parse_local_config` uses commondir).
 - `t2404-worktree-config` — 12/12 (`config --worktree` path selection, common-dir local config, `core.bare` via config cascade).
 - `t2406-worktree-repair` — 24/24 (macOS `/private` path storage, repair gitfile broken vs incorrect, normalized common dir).
