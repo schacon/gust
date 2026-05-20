@@ -126,6 +126,23 @@ fn chrono_now_for_trace2() -> String {
     )
 }
 
+/// Resolve `.git/modules/…` for checkout: per-worktree `$GIT_DIR` when linked (t2405).
+fn submodule_modules_git_dir_for_checkout(
+    repo: &Repository,
+    work_tree: &Path,
+    rel: &str,
+) -> Result<PathBuf> {
+    if let Ok(modules) = crate::commands::submodule::parse_gitmodules_with_repo(work_tree, Some(repo))
+    {
+        if let Some(m) = modules.iter().find(|m| m.path == rel) {
+            return crate::commands::submodule::submodule_separate_git_dir(
+                repo, work_tree, &m.name, rel,
+            );
+        }
+    }
+    Ok(submodule_modules_git_dir(&repo.git_dir, rel))
+}
+
 /// Run `grit submodule update --init --recursive` after a superproject checkout.
 fn recurse_submodules_after_checkout(repo: &Repository) -> Result<()> {
     let work_tree = repo.work_tree.as_ref().context("bare repository")?;
@@ -1811,14 +1828,13 @@ fn switch_branch(
                             if let Some(refname) = content.trim().strip_prefix("ref: ") {
                                 if refname.trim() == branch_ref {
                                     let gitdir_file = admin.join("gitdir");
-                                    let wt_path = if let Ok(raw) =
-                                        std::fs::read_to_string(&gitdir_file)
-                                    {
-                                        let p = std::path::Path::new(raw.trim());
-                                        p.parent().unwrap_or(p).to_string_lossy().to_string()
-                                    } else {
-                                        entry.file_name().to_string_lossy().to_string()
-                                    };
+                                    let wt_path =
+                                        if let Ok(raw) = std::fs::read_to_string(&gitdir_file) {
+                                            let p = std::path::Path::new(raw.trim());
+                                            p.parent().unwrap_or(p).to_string_lossy().to_string()
+                                        } else {
+                                            entry.file_name().to_string_lossy().to_string()
+                                        };
                                     bail!(
                                         "fatal: '{branch_name}' is already used by worktree at '{wt_path}'"
                                     );
@@ -2093,14 +2109,11 @@ fn force_create_and_switch_branch(
     validate_new_branch_name(name)?;
     let branch_ref = format!("refs/heads/{name}");
 
-    if let Some(wt_path) =
-        crate::commands::worktree_refs::branch_occupied_any_worktree(repo, name)
+    if let Some(wt_path) = crate::commands::worktree_refs::branch_occupied_any_worktree(repo, name)
     {
         let current = crate::commands::worktree_refs::current_worktree_path_for_repo(repo);
         if !crate::commands::worktree_refs::worktree_paths_equal_pub(&wt_path, &current) {
-            bail!(
-                "fatal: '{name}' is already used by worktree at '{wt_path}'"
-            );
+            bail!("fatal: '{name}' is already used by worktree at '{wt_path}'");
         }
     } else {
         let common = refs::common_dir(&repo.git_dir).unwrap_or_else(|| repo.git_dir.clone());
@@ -2120,22 +2133,17 @@ fn force_create_and_switch_branch(
                 {
                     continue;
                 }
-                if let Some(content) =
-                    crate::commands::worktree_refs::read_head_content(&admin)
-                {
+                if let Some(content) = crate::commands::worktree_refs::read_head_content(&admin) {
                     if let Some(refname) = content.trim().strip_prefix("ref: ") {
                         if refname.trim() == branch_ref {
                             let gitdir_file = admin.join("gitdir");
-                            let wt_path = if let Ok(raw) = std::fs::read_to_string(&gitdir_file)
-                            {
+                            let wt_path = if let Ok(raw) = std::fs::read_to_string(&gitdir_file) {
                                 let p = std::path::Path::new(raw.trim());
                                 p.parent().unwrap_or(p).to_string_lossy().to_string()
                             } else {
                                 entry.file_name().to_string_lossy().to_string()
                             };
-                            bail!(
-                                "fatal: '{name}' is already used by worktree at '{wt_path}'"
-                            );
+                            bail!("fatal: '{name}' is already used by worktree at '{wt_path}'");
                         }
                     }
                 }
@@ -3285,7 +3293,7 @@ pub(crate) fn checkout_gitlink_worktree_entry(
     force_populate: bool,
 ) -> Result<()> {
     let sm_dir = work_tree.join(rel);
-    let modules_git = submodule_modules_git_dir(&repo.git_dir, rel);
+    let modules_git = submodule_modules_git_dir_for_checkout(repo, work_tree, rel)?;
     let has_local_module = modules_git.join("HEAD").exists();
     // Thousands of gitlinks in one tree (e.g. synthetic submodule fixtures) are usually
     // uninitialized: no `.git/modules/<path>/HEAD`. Skip all filesystem work in that case so
@@ -3311,26 +3319,12 @@ pub(crate) fn checkout_gitlink_worktree_entry(
         let _ = std::fs::create_dir_all(&sm_dir);
     }
 
-    let modules_abs = modules_git.canonicalize().unwrap_or(modules_git);
-    let gitfile = sm_dir.join(".git");
-    let want = format!("gitdir: {}\n", modules_abs.display());
-    let need_write = match std::fs::read_to_string(&gitfile) {
-        Ok(cur) => cur != want,
-        Err(_) => true,
-    };
-    if need_write {
-        std::fs::write(&gitfile, want)?;
-    }
-    let wt_abs = sm_dir.canonicalize().unwrap_or_else(|_| sm_dir.clone());
+    grit_lib::submodule_gitdir::write_submodule_gitfile(&sm_dir, &modules_git)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let grit_bin = grit_exe::grit_executable();
-    let mut cfg_cmd = Command::new(&grit_bin);
-    grit_exe::strip_trace2_env(&mut cfg_cmd);
-    let _ = cfg_cmd
-        .arg("--git-dir")
-        .arg(&modules_abs)
-        .args(["config", "core.worktree"])
-        .arg(&wt_abs)
-        .status();
+    crate::commands::submodule::set_submodule_core_worktree(&grit_bin, &modules_git, &sm_dir);
+    let modules_abs = modules_git.canonicalize().unwrap_or(modules_git);
+    let wt_abs = sm_dir.canonicalize().unwrap_or_else(|_| sm_dir.clone());
     let oid_hex = oid.to_hex();
     let mut co_cmd = Command::new(&grit_bin);
     grit_exe::strip_trace2_env(&mut co_cmd);
