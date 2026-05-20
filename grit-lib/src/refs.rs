@@ -1046,9 +1046,8 @@ pub fn append_reflog(
     let storage_dir = ref_storage_dir(git_dir, refname);
     let stor = crate::ref_namespace::storage_ref_name(refname);
     let log_path = storage_dir.join("logs").join(&stor);
-    let may_write =
-        force_create || should_autocreate_reflog(git_dir, refname) || !message.is_empty();
-    if !may_write && !log_path.exists() {
+    let may_create = force_create || should_autocreate_reflog(git_dir, refname);
+    if !may_create && !log_path.exists() {
         return Ok(());
     }
     if let Some(parent) = log_path.parent() {
