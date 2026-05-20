@@ -149,7 +149,7 @@ pub(crate) fn finalize_sparse_clone(repo: &Repository, apply_to_index: bool) -> 
     if apply_to_index {
         crate::commands::clone::ensure_index_from_head_if_missing(repo)?;
     }
-    init_worktree_config(repo)?;
+    grit_lib::repo::init_worktree_config(&repo.git_dir)?;
     set_sparse_config(repo, true)?;
     set_cone_config(repo, true)?;
     let ws = ConeWorkspace::default();
@@ -199,18 +199,6 @@ fn worktree_config_path(repo: &Repository) -> PathBuf {
     repo.git_dir.join("config.worktree")
 }
 
-fn init_worktree_config(repo: &Repository) -> Result<()> {
-    let p = worktree_config_path(repo);
-    if p.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).ok();
-    }
-    fs::write(&p, "").context("creating config.worktree")?;
-    Ok(())
-}
-
 fn load_merged_config(repo: &Repository) -> grit_lib::config::ConfigSet {
     grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default()
 }
@@ -242,7 +230,7 @@ fn release_sparse_lock(repo: &Repository) {
 }
 
 fn set_sparse_config(repo: &Repository, enable: bool) -> Result<()> {
-    init_worktree_config(repo)?;
+    grit_lib::repo::init_worktree_config(&repo.git_dir)?;
     let path = worktree_config_path(repo);
     let content = fs::read_to_string(&path).unwrap_or_default();
     let mut cfg = ConfigFile::parse(&path, &content, ConfigScope::Worktree)?;
@@ -252,7 +240,7 @@ fn set_sparse_config(repo: &Repository, enable: bool) -> Result<()> {
 }
 
 fn set_cone_config(repo: &Repository, cone: bool) -> Result<()> {
-    init_worktree_config(repo)?;
+    grit_lib::repo::init_worktree_config(&repo.git_dir)?;
     let path = worktree_config_path(repo);
     let content = fs::read_to_string(&path).unwrap_or_default();
     let mut cfg = ConfigFile::parse(&path, &content, ConfigScope::Worktree)?;
@@ -265,7 +253,7 @@ fn set_cone_config(repo: &Repository, cone: bool) -> Result<()> {
 }
 
 fn set_sparse_index_config(repo: &Repository, enable: bool) -> Result<()> {
-    init_worktree_config(repo)?;
+    grit_lib::repo::init_worktree_config(&repo.git_dir)?;
     let path = worktree_config_path(repo);
     let content = fs::read_to_string(&path).unwrap_or_default();
     let mut cfg = ConfigFile::parse(&path, &content, ConfigScope::Worktree)?;
@@ -1191,14 +1179,9 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
                 }
             }
         } else {
-            // Paths explicitly materialized in the work tree (`skip-worktree` cleared, e.g.
-            // `git update-index --no-skip-worktree` or `git add --sparse`) must not be deleted
-            // when sparse rules are reapplied (`git reset` → `reapply_sparse_checkout_if_configured`).
-            let preserve_worktree_file =
-                !entry.skip_worktree() && fs::symlink_metadata(work_tree.join(&path_str)).is_ok();
             entry.set_skip_worktree(true);
             let full_path = work_tree.join(&path_str);
-            if full_path.exists() && !preserve_worktree_file {
+            if fs::symlink_metadata(&full_path).is_ok() {
                 let _ = fs::remove_file(&full_path);
                 if let Some(parent) = full_path.parent() {
                     remove_empty_dirs_up_to(parent, work_tree);

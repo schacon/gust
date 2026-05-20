@@ -1131,6 +1131,72 @@ pub fn worktree_config_enabled(common_dir: &Path) -> bool {
     false
 }
 
+fn open_or_create_config_file(path: &Path, scope: ConfigScope) -> Result<ConfigFile> {
+    match ConfigFile::from_path(path, scope)? {
+        Some(f) => Ok(f),
+        None => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(Error::Io)?;
+            }
+            ConfigFile::parse(path, "", scope)
+        }
+    }
+}
+
+fn config_file_bool_true(cfg: &ConfigFile, key: &str) -> bool {
+    cfg.get(key).is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "on" | "1"
+        )
+    })
+}
+
+/// Enable per-worktree configuration (`extensions.worktreeConfig`) and create
+/// `config.worktree`, matching Git's `init_worktree_config` in `worktree.c`.
+///
+/// When `core.bare` is true or `core.worktree` is set in the common config,
+/// those keys are moved into `config.worktree` so linked worktrees keep working.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] or [`Error::ConfigError`] if config files cannot be read or written.
+pub fn init_worktree_config(git_dir: &Path) -> Result<()> {
+    let common_dir = common_git_dir_for_config(git_dir);
+    let common_config_path = common_dir.join("config");
+    let worktree_config_path = git_dir.join("config.worktree");
+
+    if worktree_config_enabled(&common_dir) {
+        if !worktree_config_path.exists() {
+            if let Some(parent) = worktree_config_path.parent() {
+                fs::create_dir_all(parent).map_err(Error::Io)?;
+            }
+            fs::write(&worktree_config_path, "").map_err(Error::Io)?;
+        }
+        return Ok(());
+    }
+
+    let mut common_cfg =
+        open_or_create_config_file(&common_config_path, ConfigScope::Local)?;
+    common_cfg.set("extensions.worktreeConfig", "true")?;
+
+    let mut wt_cfg =
+        open_or_create_config_file(&worktree_config_path, ConfigScope::Worktree)?;
+
+    if config_file_bool_true(&common_cfg, "core.bare") {
+        wt_cfg.set("core.bare", "true")?;
+        common_cfg.unset("core.bare")?;
+    }
+    if let Some(worktree) = common_cfg.get("core.worktree") {
+        wt_cfg.set("core.worktree", &worktree)?;
+        common_cfg.unset("core.worktree")?;
+    }
+
+    common_cfg.write()?;
+    wt_cfg.write()?;
+    Ok(())
+}
+
 /// If the common `config` declares a repository format newer than Git's
 /// `GIT_REPO_VERSION_READ`, return the human message Git prints for
 /// `discover_git_directory_reason` / t1309.

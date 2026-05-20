@@ -693,6 +693,8 @@ fn gitignore_prefix_is_literal(prefix: &str) -> bool {
 struct SparsePattern {
     negative: bool,
     directory_only: bool,
+    /// Git `PATTERN_FLAG_NODIR`: pattern has no `/` (e.g. `/*`) — matches files only.
+    nodir: bool,
     anchored: bool,
     has_slash: bool,
     body: String,
@@ -743,9 +745,11 @@ impl SparsePattern {
         }
 
         let has_slash = raw.contains('/');
+        let nodir = !has_slash && !directory_only;
         Some(Self {
             negative,
             directory_only,
+            nodir,
             anchored,
             has_slash,
             body: raw,
@@ -759,6 +763,9 @@ impl SparsePattern {
 /// patterns with a trailing `/` in the sparse file (`PATTERN_FLAG_MUSTBEDIR`) only
 /// participate in those iterations.
 fn sparse_pattern_matches(p: &SparsePattern, pathname: &str, as_directory: bool) -> bool {
+    if p.nodir && as_directory {
+        return false;
+    }
     if p.directory_only && !as_directory {
         return false;
     }
@@ -970,6 +977,25 @@ fn path_to_slash(path: &Path) -> String {
         out.push_str(&component.as_os_str().to_string_lossy());
     }
     out
+}
+
+#[cfg(test)]
+mod sparse_checkout_tests {
+    use super::*;
+
+    #[test]
+    fn non_cone_default_init_patterns() {
+        let lines = vec!["/*".into(), "!/*/".into()];
+        assert!(path_in_sparse_checkout("a", &lines, None));
+        assert!(!path_in_sparse_checkout("folder1/a", &lines, None));
+        let wt = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        // work_tree only affects directory vs file matching on parent walks
+        let wt = std::env::temp_dir().join("grit-sparse-wt-test");
+        let _ = std::fs::create_dir_all(wt.join("folder1"));
+        let _ = std::fs::write(wt.join("a"), b"x");
+        assert!(!path_in_sparse_checkout("folder1/a", &lines, Some(&wt)));
+        assert!(!path_in_sparse_checkout("folder1", &lines, Some(&wt)));
+    }
 }
 
 #[cfg(test)]

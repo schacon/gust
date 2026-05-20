@@ -121,7 +121,7 @@ Build on existing `sparse_checkout.rs` and index `sdir` extension support.
 
 ### 2.1 Sparse index and read-tree integration
 
-- [ ] Cone/non-cone pattern load/save (`$GIT_DIR/info/sparse-checkout`,
+- [~] Cone/non-cone pattern load/save (`$GIT_DIR/info/sparse-checkout`,
   `index.sparse` config).
 - [ ] `read-tree` / checkout: only materialize included paths; skip-worktree +
   sparse directory entries in index v4.
