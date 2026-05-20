@@ -233,7 +233,11 @@ pub(crate) fn run_command_with_aliases(
 ) -> Result<()> {
     let git_dir = std::env::var("GIT_DIR")
         .ok()
-        .map(PathBuf::from)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| {
+            let path = PathBuf::from(raw);
+            grit_lib::repo::resolve_git_directory_arg(&path).ok()
+        })
         .or_else(|| {
             grit_lib::repo::Repository::discover(None)
                 .ok()

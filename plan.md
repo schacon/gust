@@ -64,7 +64,7 @@ inject **time** and **environment** at boundaries; no `.unwrap()` in library cod
 
 Keep existing strengths stable while moving logic down from the binary.
 
-- [ ] **0.1 Repository session API** — Single `Repository::open` path with explicit
+- [~] **0.1 Repository session API** — Single `Repository::open` path with explicit
   `GitDir`, common dir, work tree, commondir, and config load order documented.
   - Harness: `t1510-repo-setup`, `t1517-outside-repo` (subset: open/discovery only)
 - [ ] **0.2 Move transport negotiation to lib** — `fetch_transport` / smart HTTP

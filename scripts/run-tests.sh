@@ -174,8 +174,12 @@ else
   unset GRIT_FAMILY_FILTER 2>/dev/null || true
 fi
 
-# Build list of files to run: skip in_scope=skip
-mapfile -t FILES < <(
+# Build list of files to run: skip in_scope=skip. Use a read loop instead of
+# Bash 4 `mapfile` so the runner works with macOS' default Bash 3.
+FILES=()
+while IFS= read -r file; do
+  FILES+=("$file")
+done < <(
   python3 - "$CSV" "$TESTS_DIR" "$FROM" "${POS[@]}" <<'PY'
 import csv, os, sys, glob
 
@@ -323,6 +327,8 @@ LINE_TMP="$(mktemp)"
 trap 'rm -f "$LINE_TMP"' EXIT
 
 run_one() {
+  # Bash 3 treats empty array expansions as unbound under `set -u`.
+  set +u
   local f="$1"
   local base="${f%.sh}"
   local output summary total pass fail status ef
@@ -366,6 +372,7 @@ run_one() {
         GIT_CONFIG_PARAMETERS= \
         "${timeout_prefix[@]}" bash "$f" 2>&1
   ) || true
+  set -u
   summary=$(echo "$output" | grep "^# Tests:" | tail -1) || true
   total=0 pass=0 fail=0 status="error"
   if [[ -n "$summary" ]]; then

@@ -992,9 +992,7 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
         }
         "create-symref" => {
             if rest.len() < 5 {
-                bail!(
-                    "usage: test-tool ref-store main create-symref <refname> <target> [logmsg]"
-                );
+                bail!("usage: test-tool ref-store main create-symref <refname> <target> [logmsg]");
             }
             let refname = &rest[3];
             let target = &rest[4];
