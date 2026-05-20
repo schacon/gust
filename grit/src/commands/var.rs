@@ -7,11 +7,11 @@
 
 use anyhow::{bail, Result};
 use clap::Args as ClapArgs;
-use grit_lib::config::ConfigSet;
+use grit_lib::config::{global_config_paths_pub, ConfigSet};
 use std::io::{self, Write};
 use time::OffsetDateTime;
 
-use crate::ident::{peek_name, resolve_email_lenient, IdentRole};
+use crate::ident::{peek_name, resolve_email_lenient, resolve_name, IdentRole};
 
 /// Arguments for `grit var`.
 #[derive(Debug, ClapArgs)]
