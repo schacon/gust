@@ -507,7 +507,7 @@ fn verify_refname_available_for_batch_create(
     }
 }
 
-fn commit_batch_staged(repo: &Repository, args: &Args, staged: &[(bool, BatchOp)]) -> Result<()> {
+fn verify_batch_staged(repo: &Repository, staged: &[(bool, BatchOp)]) -> Result<()> {
     for (nd, op) in staged {
         match op {
             BatchOp::CreateOid { refname, .. } => {
@@ -520,12 +520,21 @@ fn commit_batch_staged(repo: &Repository, args: &Args, staged: &[(bool, BatchOp)
             _ => {}
         }
     }
+    Ok(())
+}
 
-    let hook_updates = hook_updates_for_ops(staged)?;
-    run_ref_transaction_prepare(repo, &hook_updates)?;
+fn apply_batch_staged(repo: &Repository, args: &Args, staged: &[(bool, BatchOp)]) -> Result<()> {
     for (nd, op) in staged {
         apply_batch_op(repo, args, *nd, op.clone())?;
     }
+    Ok(())
+}
+
+fn commit_batch_staged(repo: &Repository, args: &Args, staged: &[(bool, BatchOp)]) -> Result<()> {
+    verify_batch_staged(repo, staged)?;
+    let hook_updates = hook_updates_for_ops(staged)?;
+    run_ref_transaction_prepare(repo, &hook_updates)?;
+    apply_batch_staged(repo, args, staged)?;
     run_ref_transaction_committed(repo, &hook_updates);
     Ok(())
 }
@@ -774,10 +783,11 @@ fn process_batch_command(
 
             let drained: Vec<(bool, BatchOp)> = staged.drain(..).collect();
             let hook_updates = hook_updates_for_ops(&drained)?;
+            verify_batch_staged(repo, &drained)?;
             if !*transaction_prepared {
                 run_ref_transaction_prepare(repo, &hook_updates)?;
             }
-            match commit_batch_staged(repo, args, &drained) {
+            match apply_batch_staged(repo, args, &drained) {
                 Ok(()) => {
                     run_ref_transaction_committed(repo, &hook_updates);
                 }
