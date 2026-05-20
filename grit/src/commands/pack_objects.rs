@@ -599,7 +599,8 @@ pub fn run(mut args: Args) -> Result<()> {
     let pack_hash_bytes = pack_trailer_bytes_for_repo(&repo.git_dir);
 
     // Collect object IDs.
-    let pack_list = collect_oids(&repo, &args)?;
+    let mut pack_list = collect_oids(&repo, &args)?;
+    omit_prefiltered_blobs(&repo, &mut pack_list.oids, args.filter.as_deref())?;
 
     // Git shows this progress title when progress is enabled. Tests set `GIT_PROGRESS_DELAY` and
     // capture stderr to a file (not a TTY); match that by honoring the env var even when stderr
@@ -1504,6 +1505,68 @@ fn apply_list_objects_filter(entries: &mut Vec<PackEntry>, filter: Option<&str>)
     if spec == "blob:none" {
         entries.retain(|e| e.kind != ObjectKind::Blob);
     }
+}
+
+fn omit_prefiltered_blobs(
+    repo: &Repository,
+    oids: &mut Vec<ObjectId>,
+    filter: Option<&str>,
+) -> Result<()> {
+    if filter.map(str::trim) != Some("blob:none") {
+        return Ok(());
+    }
+
+    let mut keep = Vec::with_capacity(oids.len());
+    for oid in oids.iter().copied() {
+        let obj = read_object_from_repo_unverified(repo, &oid)?;
+        if obj.kind != ObjectKind::Blob {
+            keep.push(oid);
+        }
+    }
+    *oids = keep;
+    Ok(())
+}
+
+fn read_object_from_repo_unverified(
+    repo: &Repository,
+    oid: &ObjectId,
+) -> Result<grit_lib::objects::Object> {
+    if let Ok(obj) = repo.odb.read(oid) {
+        return Ok(obj);
+    }
+
+    let indexes = grit_lib::pack::read_local_pack_indexes(repo.odb.objects_dir())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for idx in &indexes {
+        if let Some(entry) = idx
+            .entries
+            .iter()
+            .find(|e| grit_lib::pack::pack_index_entry_matches_sha1_oid(e, oid))
+        {
+            let pack_bytes = std::fs::read(&idx.pack_path)?;
+            return read_object_from_pack(&pack_bytes, entry.offset, &indexes, idx.hash_bytes);
+        }
+    }
+
+    maybe_lazy_fetch_missing_object(repo, oid)?;
+    if let Ok(obj) = repo.odb.read(oid) {
+        return Ok(obj);
+    }
+
+    let indexes = grit_lib::pack::read_local_pack_indexes(repo.odb.objects_dir())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for idx in &indexes {
+        if let Some(entry) = idx
+            .entries
+            .iter()
+            .find(|e| grit_lib::pack::pack_index_entry_matches_sha1_oid(e, oid))
+        {
+            let pack_bytes = std::fs::read(&idx.pack_path)?;
+            return read_object_from_pack(&pack_bytes, entry.offset, &indexes, idx.hash_bytes);
+        }
+    }
+
+    bail!("object not found: {}", oid.to_hex())
 }
 
 fn pack_all_use_reachable_closure_only(args: &Args) -> bool {
@@ -2609,10 +2672,11 @@ fn walk_reachable(
 
 /// Read an object from loose store or pack files.
 fn read_object_from_repo(repo: &Repository, oid: &ObjectId) -> Result<grit_lib::objects::Object> {
-    // Try loose first.
-    if let Ok(obj) = repo.odb.read(oid) {
-        return Ok(obj);
+    let loose_path = repo.odb.object_path(oid);
+    if loose_path.is_file() {
+        return Odb::read_loose_verify_oid(&loose_path, oid).map_err(|e| anyhow::anyhow!("{e}"));
     }
+
     // Try pack files.
     let indexes = grit_lib::pack::read_local_pack_indexes(repo.odb.objects_dir())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2628,8 +2692,9 @@ fn read_object_from_repo(repo: &Repository, oid: &ObjectId) -> Result<grit_lib::
         }
     }
     maybe_lazy_fetch_missing_object(repo, oid)?;
-    if let Ok(obj) = repo.odb.read(oid) {
-        return Ok(obj);
+    let loose_path = repo.odb.object_path(oid);
+    if loose_path.is_file() {
+        return Odb::read_loose_verify_oid(&loose_path, oid).map_err(|e| anyhow::anyhow!("{e}"));
     }
     let indexes = grit_lib::pack::read_local_pack_indexes(repo.odb.objects_dir())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
