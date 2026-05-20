@@ -65,7 +65,6 @@ fn dowild(p: &[u8], text: &[u8], flags: u32) -> i32 {
                 }
             }
             b'*' => {
-                let star_start = pi;
                 // Determine if this is ** and whether it matches slashes.
                 let prev_p = pi; // position of first *
                 pi += 1;
@@ -115,7 +114,7 @@ fn dowild(p: &[u8], text: &[u8], flags: u32) -> i32 {
                         ti += pos;
                         // Git: leave `text` at `/`, then the for-loop does `text++, p++`.
                         ti += 1;
-                        pi = star_start + 2;
+                        pi += 1;
                         continue;
                     } else {
                         return WM_ABORT_ALL;
