@@ -97,9 +97,9 @@ tests. Most logic belongs in a new **`grit-lib/src/worktree.rs`** (and friends).
 
 ### 1.3 Commands using worktree index and refs
 
-- [~] Index path: per-worktree `index` and shared vs private ref reads on
+- [x] Index path: per-worktree `index` and shared vs private ref reads on
   `status`, `diff`, `commit`, `reset`, `merge`, `checkout` (non-interactive).
-- [~] Hook env: correct `GIT_WORK_TREE`, `GIT_DIR`, `GIT_COMMON_DIR` per worktree.
+- [x] Hook env: correct `GIT_WORK_TREE`, `GIT_DIR`, `GIT_COMMON_DIR` per worktree.
 
 ### 1.4 Harness targets (worktrees)
 
